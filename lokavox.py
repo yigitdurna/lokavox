@@ -2,11 +2,18 @@
 """
 lokavox.py — Local push-to-talk dictation using whisper.cpp
 
-Hold dictation key (F5) to record, release to transcribe and paste.
-Double-tap to toggle: recording continues, tap again to stop.
-Pauses/resumes media playback automatically during recording.
+Default hotkey:
+    Hold Control (either side)   push-to-talk
+    Control + `  (backtick)      toggle recording on/off
 
-Menu bar: outline mic (idle), filled mic (recording), mic+dots (transcribing).
+Alternative hotkey (change in Preferences):
+    Hold F5 / dictation key      push-to-talk
+    Double-tap F5                toggle recording on/off
+
+Pauses media playback (Spotify, Apple Music, Brave/Chrome/Safari video)
+while recording and resumes after. Menu bar shows state: outline mic
+(idle), filled mic (recording), mic+dots (transcribing).
+
 Everything runs locally. No cloud, no API keys.
 
 Dependencies:
@@ -48,6 +55,8 @@ try:
         NSColor,
         NSFont,
         NSPopUpButton,
+        NSButton,
+        NSBox,
         NSApp,
     )
     from PyObjCTools import AppHelper
@@ -66,9 +75,20 @@ _DEFAULT_VOCAB = []
 _DEFAULT_FIXUPS = []
 
 # macOS key codes
-KEYCODE_DICTATION = 176
-DOUBLE_TAP_WINDOW = 0.35  # seconds
-MIN_RECORDING_SECS = 0.7  # ignore accidental taps
+KEYCODE_LEFT_CTRL = 59
+KEYCODE_RIGHT_CTRL = 62
+KEYCODE_BACKTICK = 50   # ` key (US layout)
+KEYCODE_DICTATION = 176  # Dedicated mic/dictation key on modern Macs
+
+# Timing
+HOLD_DELAY = 0.25         # Hold modifier this long before recording starts
+DOUBLE_TAP_WINDOW = 0.35  # F5 mode double-tap toggle window
+MIN_RECORDING_SECS = 0.7  # Ignore accidentally short recordings
+
+# Hotkey modes
+HOTKEY_CONTROL = "Control"
+HOTKEY_DICTATION = "Dictation Key (F5 row)"
+HOTKEY_MODES = [HOTKEY_CONTROL, HOTKEY_DICTATION]
 
 # Whisper hallucinates these on silence/short audio
 _HALLUCINATIONS = {
@@ -153,6 +173,7 @@ class Settings:
         self.vocab = list(_DEFAULT_VOCAB)
         self.fixups = list(_DEFAULT_FIXUPS)
         self.style = "Standard"
+        self.hotkey = HOTKEY_CONTROL
         self.load()
 
     def load(self):
@@ -163,15 +184,19 @@ class Settings:
                 self.fixups = data.get("fixups", list(_DEFAULT_FIXUPS))
                 s = data.get("style", "Standard")
                 self.style = s if s in self.STYLES else "Standard"
+                h = data.get("hotkey", HOTKEY_CONTROL)
+                self.hotkey = h if h in HOTKEY_MODES else HOTKEY_CONTROL
             except (json.JSONDecodeError, OSError):
                 pass
 
     def save(self):
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(
-            {"vocab": self.vocab, "fixups": self.fixups, "style": self.style},
-            indent=2,
-        ))
+        SETTINGS_FILE.write_text(json.dumps({
+            "vocab": self.vocab,
+            "fixups": self.fixups,
+            "style": self.style,
+            "hotkey": self.hotkey,
+        }, indent=2))
 
     def vocab_string(self):
         return ", ".join(self.vocab)
@@ -211,17 +236,22 @@ class _PrefsController(NSObject):
         if self is None:
             return None
         self._window = None
+        self._hotkey_popup = None
+        self._style_popup = None
         self._vocab_tv = None
         self._fixups_tv = None
+        self._saved_label = None
+        self._saved_timer = None
         return self
 
     def showWindow_(self, sender):
         if self._window is not None:
+            self._sync_from_settings()
             self._window.makeKeyAndOrderFront_(None)
             NSApp.activateIgnoringOtherApps_(True)
             return
 
-        W, H = 480, 560
+        W, H = 520, 760
         PAD = 20
         style = 1 | 2  # Titled | Closable
 
@@ -236,14 +266,30 @@ class _PrefsController(NSObject):
         content = window.contentView()
         y = H - 30
 
-        # Writing Style section
+        # --- Hotkey section ---
+        y = self._add_label(content, "Hotkey", True, y, W)
+        y = self._add_multiline(
+            content,
+            "Control: hold either Control key to talk, Control+` (backtick) "
+            "to toggle recording on/off.",
+            y, W, lines=2,
+        )
+        self._hotkey_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            ((PAD, y - 28), (W - PAD * 2, 28)), False
+        )
+        self._hotkey_popup.addItemsWithTitles_(HOTKEY_MODES)
+        self._hotkey_popup.selectItemWithTitle_(settings.hotkey)
+        content.addSubview_(self._hotkey_popup)
+        y -= 40
+        y = self._separator(content, y, W)
+
+        # --- Writing Style section ---
         y = self._add_label(content, "Writing Style", True, y, W)
-        _style_desc = {
-            "Standard": "Proper capitalization and punctuation",
-            "Lowercase": "All lowercase, punctuation kept",
-        }
-        y = self._add_label(
-            content, _style_desc.get(settings.style, ""), False, y, W
+        y = self._add_multiline(
+            content,
+            "Standard = proper capitalization and punctuation. "
+            "Lowercase = all lowercase, punctuation kept.",
+            y, W, lines=2,
         )
         self._style_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
             ((PAD, y - 28), (W - PAD * 2, 28)), False
@@ -251,28 +297,136 @@ class _PrefsController(NSObject):
         self._style_popup.addItemsWithTitles_(Settings.STYLES)
         self._style_popup.selectItemWithTitle_(settings.style)
         content.addSubview_(self._style_popup)
-        y -= 44
+        y -= 40
+        y = self._separator(content, y, W)
 
-        # Vocabulary section
+        # --- Vocabulary section ---
         y = self._add_label(content, "Vocabulary", True, y, W)
-        y = self._add_label(content, "One word or phrase per line", False, y, W)
-        self._vocab_tv, y = self._add_text_area(content, y - 4, W, 160)
-        self._vocab_tv.setString_("\n".join(settings.vocab))
-
-        y -= 16
-
-        # Corrections section
-        y = self._add_label(content, "Corrections", True, y, W)
-        y = self._add_label(
-            content, "One per line:  wrong >> right", False, y, W
+        y = self._add_multiline(
+            content,
+            "Words or phrases to help Whisper recognize domain terms "
+            "(names, products, jargon). One per line.",
+            y, W, lines=2,
         )
-        self._fixups_tv, y = self._add_text_area(content, y - 4, W, 160)
+        self._vocab_tv, y = self._add_text_area(content, y - 4, W, 120)
+        self._vocab_tv.setString_("\n".join(settings.vocab))
+        y -= 12
+        y = self._separator(content, y, W)
+
+        # --- Corrections section ---
+        y = self._add_label(content, "Corrections", True, y, W)
+        y = self._add_multiline(
+            content,
+            "Find-and-replace rules applied after transcription. "
+            "One per line, format:  wrong >> right",
+            y, W, lines=2,
+        )
+        self._fixups_tv, y = self._add_text_area(content, y - 4, W, 120)
         lines = [f'{f["from"]} >> {f["to"]}' for f in settings.fixups]
         self._fixups_tv.setString_("\n".join(lines))
+        y -= 18
+
+        # --- Save button + saved-feedback label ---
+        btn_w, btn_h = 90, 30
+        save_btn = NSButton.alloc().initWithFrame_(
+            ((W - PAD - btn_w, y - btn_h), (btn_w, btn_h))
+        )
+        save_btn.setTitle_("Save")
+        save_btn.setBezelStyle_(1)  # NSRoundedBezelStyle
+        save_btn.setKeyEquivalent_("\r")  # Default button, Enter key
+        save_btn.setTarget_(self)
+        save_btn.setAction_("saveClicked:")
+        content.addSubview_(save_btn)
+
+        saved_label = NSTextField.alloc().initWithFrame_(
+            ((PAD, y - btn_h + 6), (W - PAD * 2 - btn_w - 10, 20))
+        )
+        saved_label.setStringValue_("")
+        saved_label.setBezeled_(False)
+        saved_label.setDrawsBackground_(False)
+        saved_label.setEditable_(False)
+        saved_label.setSelectable_(False)
+        saved_label.setFont_(NSFont.systemFontOfSize_(12))
+        saved_label.setTextColor_(NSColor.secondaryLabelColor())
+        content.addSubview_(saved_label)
+        self._saved_label = saved_label
 
         self._window = window
         window.makeKeyAndOrderFront_(None)
         NSApp.activateIgnoringOtherApps_(True)
+
+    def _sync_from_settings(self):
+        """Refresh UI fields from current settings (used when re-showing window)."""
+        if self._hotkey_popup is not None:
+            self._hotkey_popup.selectItemWithTitle_(settings.hotkey)
+        if self._style_popup is not None:
+            self._style_popup.selectItemWithTitle_(settings.style)
+        if self._vocab_tv is not None:
+            self._vocab_tv.setString_("\n".join(settings.vocab))
+        if self._fixups_tv is not None:
+            lines = [f'{f["from"]} >> {f["to"]}' for f in settings.fixups]
+            self._fixups_tv.setString_("\n".join(lines))
+
+    def saveClicked_(self, sender):
+        self._commit()
+        self._show_saved_feedback()
+
+    def _show_saved_feedback(self):
+        if self._saved_label is None:
+            return
+        self._saved_label.setStringValue_("✓ Saved")
+        self._saved_label.setTextColor_(NSColor.systemGreenColor())
+        if self._saved_timer:
+            self._saved_timer.cancel()
+        t = threading.Timer(1.5, self._clear_saved_feedback)
+        t.daemon = True
+        t.start()
+        self._saved_timer = t
+
+    def _clear_saved_feedback(self):
+        def clear():
+            if self._saved_label is not None:
+                self._saved_label.setStringValue_("")
+        AppHelper.callAfter(clear)
+
+    def _commit(self):
+        # Hotkey
+        h = str(self._hotkey_popup.titleOfSelectedItem())
+        if h in HOTKEY_MODES:
+            settings.hotkey = h
+
+        # Style
+        settings.style = str(self._style_popup.titleOfSelectedItem())
+
+        # Vocabulary
+        text = str(self._vocab_tv.string())
+        settings.vocab = [l.strip() for l in text.split("\n") if l.strip()]
+
+        # Corrections
+        text = str(self._fixups_tv.string())
+        settings.fixups = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            sep = ">>" if ">>" in line else "\u2192" if "\u2192" in line else None
+            if sep is None:
+                continue
+            parts = line.split(sep, 1)
+            f, t = parts[0].strip(), parts[1].strip()
+            if f and t:
+                settings.fixups.append({"from": f, "to": t})
+
+        settings.save()
+
+    def _separator(self, parent, y, w):
+        PAD = 20
+        sep = NSBox.alloc().initWithFrame_(
+            ((PAD, y - 10), (w - PAD * 2, 1))
+        )
+        sep.setBoxType_(2)  # NSBoxSeparator
+        parent.addSubview_(sep)
+        return y - 18
 
     def _add_label(self, parent, text, bold, y, w):
         PAD = 20
@@ -292,7 +446,26 @@ class _PrefsController(NSObject):
             label.setFont_(NSFont.systemFontOfSize_(size))
             label.setTextColor_(NSColor.secondaryLabelColor())
         parent.addSubview_(label)
-        return y - h - 2
+        return y - h - 3
+
+    def _add_multiline(self, parent, text, y, w, lines=2):
+        PAD = 20
+        line_h = 14
+        h = line_h * lines
+        label = NSTextField.alloc().initWithFrame_(
+            ((PAD, y - h), (w - PAD * 2, h))
+        )
+        label.setStringValue_(text)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setFont_(NSFont.systemFontOfSize_(11))
+        label.setTextColor_(NSColor.secondaryLabelColor())
+        label.cell().setWraps_(True)
+        label.cell().setScrollable_(False)
+        parent.addSubview_(label)
+        return y - h - 4
 
     def _add_text_area(self, parent, y, w, h):
         PAD = 20
@@ -313,31 +486,10 @@ class _PrefsController(NSObject):
         return tv, y - h
 
     def windowShouldClose_(self, sender):
-        # Save style
-        settings.style = str(self._style_popup.titleOfSelectedItem())
-
-        # Save vocabulary
-        text = str(self._vocab_tv.string())
-        settings.vocab = [l.strip() for l in text.split("\n") if l.strip()]
-
-        # Save corrections
-        text = str(self._fixups_tv.string())
-        settings.fixups = []
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            sep = ">>" if ">>" in line else "\u2192" if "\u2192" in line else None
-            if sep is None:
-                continue
-            parts = line.split(sep, 1)
-            f, t = parts[0].strip(), parts[1].strip()
-            if f and t:
-                settings.fixups.append({"from": f, "to": t})
-
-        settings.save()
-        self._window.orderOut_(None)  # Hide, don't close
-        return False  # Prevent actual window close
+        # Auto-save on close as a safety net.
+        self._commit()
+        self._window.orderOut_(None)
+        return False
 
 
 class MenuBar:
@@ -395,15 +547,21 @@ class LokaVox:
         self.menubar = None
         self.recording = False
         self.transcribing = False
+        self.toggle_active = False
         self.sox_process = None
         self.audio_file = None
-        self.toggle_active = False
-        self._f5_held = False
-        self._stop_timer = None
         self._tap = None
         self._media_was_playing = False
         self._playing_app = None
         self._recording_start = 0
+
+        # Control-mode state
+        self._ctrl_held = False
+        self._start_timer = None   # Hold-delay timer before PTT starts
+
+        # F5-mode state
+        self._f5_held = False
+        self._stop_timer = None    # Double-tap wait timer
 
     def preflight(self):
         missing = []
@@ -534,7 +692,6 @@ class LokaVox:
                 return ""
             for pattern, replacement in settings.fixups_compiled():
                 text = pattern.sub(replacement, text)
-            # Apply writing style
             if settings.style == "Lowercase":
                 text = text.lower()
             return text
@@ -580,8 +737,9 @@ class LokaVox:
                 target=self._transcribe_and_paste, args=(audio_path,)
             ).start()
 
+    # --- Event tap ---
+
     def _event_callback(self, proxy, event_type, event, refcon):
-        # Re-enable tap if macOS disabled it due to slow callback
         if event_type == Quartz.kCGEventTapDisabledByTimeout:
             Quartz.CGEventTapEnable(self._tap, True)
             return event
@@ -589,15 +747,107 @@ class LokaVox:
         keycode = Quartz.CGEventGetIntegerValueField(
             event, Quartz.kCGKeyboardEventKeycode
         )
+        flags = Quartz.CGEventGetFlags(event)
+        mode = settings.hotkey
 
-        if keycode == KEYCODE_DICTATION:
-            if event_type == Quartz.kCGEventKeyDown:
-                self._on_f5_down()
-            elif event_type == Quartz.kCGEventKeyUp:
-                self._on_f5_up()
-            return None  # Suppress F5 — don't trigger macOS dictation
+        if mode == HOTKEY_CONTROL:
+            # Control modifier press/release
+            if event_type == Quartz.kCGEventFlagsChanged and keycode in (
+                KEYCODE_LEFT_CTRL, KEYCODE_RIGHT_CTRL
+            ):
+                ctrl_now = bool(flags & Quartz.kCGEventFlagMaskControl)
+                if ctrl_now and not self._ctrl_held:
+                    self._on_ctrl_down()
+                elif not ctrl_now and self._ctrl_held:
+                    self._on_ctrl_up()
+                return event  # Pass through — Control is a shared modifier
+
+            # Control+Backtick for toggle
+            if (
+                event_type == Quartz.kCGEventKeyDown
+                and keycode == KEYCODE_BACKTICK
+                and (flags & Quartz.kCGEventFlagMaskControl)
+            ):
+                self._on_toggle()
+                return None  # Suppress
+
+            # Any other key press while waiting for PTT cancels it
+            if (
+                event_type == Quartz.kCGEventKeyDown
+                and self._start_timer is not None
+            ):
+                self._cancel_ptt_start()
+
+            return event
+
+        if mode == HOTKEY_DICTATION:
+            if keycode == KEYCODE_DICTATION:
+                if event_type == Quartz.kCGEventKeyDown:
+                    self._on_f5_down()
+                elif event_type == Quartz.kCGEventKeyUp:
+                    self._on_f5_up()
+                return None  # Suppress F5 to block macOS dictation
+            return event
 
         return event
+
+    # --- Control-mode handlers ---
+
+    def _on_ctrl_down(self):
+        if self._ctrl_held:
+            return
+        self._ctrl_held = True
+        # Ignore Ctrl while already in toggle-mode recording or transcribing
+        if self.recording or self.transcribing:
+            return
+        # Schedule PTT start after hold delay
+        if self._start_timer:
+            self._start_timer.cancel()
+        self._start_timer = threading.Timer(HOLD_DELAY, self._confirm_ptt_start)
+        self._start_timer.daemon = True
+        self._start_timer.start()
+
+    def _confirm_ptt_start(self):
+        self._start_timer = None
+        if not self._ctrl_held:
+            return
+        if self.recording or self.transcribing:
+            return
+        self.toggle_active = False
+        self.start_recording()
+
+    def _cancel_ptt_start(self):
+        if self._start_timer:
+            self._start_timer.cancel()
+            self._start_timer = None
+
+    def _on_ctrl_up(self):
+        if not self._ctrl_held:
+            return
+        self._ctrl_held = False
+        # Cancel any pending start — hold was too short to count as PTT
+        if self._start_timer:
+            self._cancel_ptt_start()
+            return
+        # If we were PTT-recording, stop on release
+        if self.recording and not self.toggle_active:
+            self._handle_stop()
+        # If toggle_active, ignore Ctrl release (user released after Ctrl+`)
+
+    def _on_toggle(self):
+        # Ctrl+Backtick pressed: toggle recording regardless of PTT state
+        self._cancel_ptt_start()
+        if self.transcribing:
+            return
+        if self.recording:
+            # Stop any active recording (PTT or toggle)
+            self.toggle_active = False
+            self._handle_stop()
+        else:
+            self.toggle_active = True
+            self.start_recording()
+
+    # --- F5-mode handlers (unchanged legacy behavior) ---
 
     def _on_f5_down(self):
         if self._f5_held:
@@ -622,10 +872,10 @@ class LokaVox:
     def _on_f5_up(self):
         self._f5_held = False
         if self.recording and not self.toggle_active:
-            # Delay stop to allow double-tap detection
             self._stop_timer = threading.Timer(
                 DOUBLE_TAP_WINDOW, self._delayed_stop
             )
+            self._stop_timer.daemon = True
             self._stop_timer.start()
 
     def _delayed_stop(self):
@@ -633,12 +883,18 @@ class LokaVox:
         if self.recording and not self.toggle_active:
             self._handle_stop()
 
+    # --- Run loop ---
+
     def run(self):
         self.preflight()
 
         print("LokaVox ready.")
-        print("  Hold F5 → hold-to-talk")
-        print("  Double-tap F5 → toggle recording on/off")
+        if settings.hotkey == HOTKEY_CONTROL:
+            print("  Hold Control → hold-to-talk (250ms before recording starts)")
+            print("  Control + ` → toggle recording on/off")
+        else:
+            print("  Hold F5 (dictation key) → hold-to-talk")
+            print("  Double-tap F5 → toggle recording on/off")
         print(f"  Language: {self.language}")
         print(f"  Model: {MODEL.name}")
         print()
@@ -650,10 +906,13 @@ class LokaVox:
         app.setDelegate_(self._app_delegate)
         self.menubar = MenuBar()
 
-        # CGEventTap — intercepts keyboard events, can suppress them
+        # CGEventTap — intercepts keyboard events. FlagsChanged is required
+        # for Control-mode modifier detection; KeyDown/KeyUp for F5 and for
+        # Control+Backtick / cancel-on-other-key.
         mask = (
             Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
+            | Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
         )
 
         self._tap = Quartz.CGEventTapCreate(
