@@ -58,8 +58,8 @@ Click the menu bar mic → Preferences. You can set:
 
 - **Hotkey** — `Control` (default) or `Dictation Key (F5 row)`
 - **Writing style** — `Standard` (proper caps + punctuation) or `Lowercase`
-- **Vocabulary** — one word or phrase per line, passed to whisper as a prompt so it recognizes domain terms like product names or jargon
-- **Corrections** — one per line, format `wrong >> right`, applied as word-boundary regex after transcription
+- **Vocabulary** — token field for words and phrases passed to Whisper as a prompt so it recognizes domain terms like product names or jargon. Type a word and press Enter or comma to add it as a pill; select a pill and press Backspace to remove.
+- **Corrections** — a scrollable list of find-and-replace rules applied after transcription. Click **+ Add correction** to create a new row, fill in the two fields, and click the **×** to delete a row. Matches are word-boundary and case-insensitive.
 
 Click **Save** to commit and see a `✓ Saved` confirmation; closing the window also saves automatically. Settings persist in `~/.local/share/lokavox/settings.json`.
 

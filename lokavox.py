@@ -4,7 +4,7 @@ lokavox.py — Local push-to-talk dictation using whisper.cpp
 
 Default hotkey:
     Hold Control (either side)   push-to-talk
-    Control + `  (backtick)      toggle recording on/off
+    Control + Escape             toggle recording on/off
 
 Alternative hotkey (change in Preferences):
     Hold F5 / dictation key      push-to-talk
@@ -39,7 +39,7 @@ from pathlib import Path
 try:
     import objc
     import Quartz
-    from Foundation import NSObject
+    from Foundation import NSObject, NSCharacterSet
     from AppKit import (
         NSApplication,
         NSImage,
@@ -49,8 +49,10 @@ try:
         NSMenuItem,
         NSApplicationActivationPolicyAccessory,
         NSWindow,
+        NSView,
         NSTextField,
         NSTextView,
+        NSTokenField,
         NSScrollView,
         NSColor,
         NSFont,
@@ -77,8 +79,8 @@ _DEFAULT_FIXUPS = []
 # macOS key codes
 KEYCODE_LEFT_CTRL = 59
 KEYCODE_RIGHT_CTRL = 62
-KEYCODE_BACKTICK = 50   # ` key (US layout)
-KEYCODE_DICTATION = 176  # Dedicated mic/dictation key on modern Macs
+KEYCODE_ESCAPE = 53       # Universal across keyboard layouts
+KEYCODE_DICTATION = 176   # Dedicated mic/dictation key on modern Macs
 
 # Timing
 HOLD_DELAY = 0.25         # Hold modifier this long before recording starts
@@ -226,6 +228,13 @@ class _AppDelegate(NSObject):
         return False
 
 
+class _FlippedView(NSView):
+    """Plain NSView with top-down coordinates (origin at top-left)."""
+
+    def isFlipped(self):
+        return True
+
+
 # --- Preferences Window ---
 
 class _PrefsController(NSObject):
@@ -238,8 +247,9 @@ class _PrefsController(NSObject):
         self._window = None
         self._hotkey_popup = None
         self._style_popup = None
-        self._vocab_tv = None
-        self._fixups_tv = None
+        self._vocab_tokens = None
+        self._fixups_doc = None
+        self._fixups_rows = []
         self._saved_label = None
         self._saved_timer = None
         return self
@@ -270,7 +280,7 @@ class _PrefsController(NSObject):
         y = self._add_label(content, "Hotkey", True, y, W)
         y = self._add_multiline(
             content,
-            "Control: hold either Control key to talk, Control+` (backtick) "
+            "Control: hold either Control key to talk, Control+Escape "
             "to toggle recording on/off.",
             y, W, lines=2,
         )
@@ -281,7 +291,7 @@ class _PrefsController(NSObject):
         self._hotkey_popup.selectItemWithTitle_(settings.hotkey)
         content.addSubview_(self._hotkey_popup)
         y -= 40
-        y = self._separator(content, y, W)
+        y = self._add_separator(content, y, W)
 
         # --- Writing Style section ---
         y = self._add_label(content, "Writing Style", True, y, W)
@@ -298,33 +308,61 @@ class _PrefsController(NSObject):
         self._style_popup.selectItemWithTitle_(settings.style)
         content.addSubview_(self._style_popup)
         y -= 40
-        y = self._separator(content, y, W)
+        y = self._add_separator(content, y, W)
 
         # --- Vocabulary section ---
         y = self._add_label(content, "Vocabulary", True, y, W)
         y = self._add_multiline(
             content,
-            "Words or phrases to help Whisper recognize domain terms "
-            "(names, products, jargon). One per line.",
+            "Words or phrases to help Whisper recognize names, products, "
+            "and jargon. Type and press Enter or comma to add a token.",
             y, W, lines=2,
         )
-        self._vocab_tv, y = self._add_text_area(content, y - 4, W, 120)
-        self._vocab_tv.setString_("\n".join(settings.vocab))
-        y -= 12
-        y = self._separator(content, y, W)
+        token_h = 80
+        self._vocab_tokens = NSTokenField.alloc().initWithFrame_(
+            ((PAD, y - token_h), (W - PAD * 2, token_h))
+        )
+        charset = NSCharacterSet.characterSetWithCharactersInString_(",\n")
+        self._vocab_tokens.setTokenizingCharacterSet_(charset)
+        self._vocab_tokens.setObjectValue_(list(settings.vocab))
+        content.addSubview_(self._vocab_tokens)
+        y -= token_h + 12
+        y = self._add_separator(content, y, W)
 
         # --- Corrections section ---
         y = self._add_label(content, "Corrections", True, y, W)
         y = self._add_multiline(
             content,
             "Find-and-replace rules applied after transcription. "
-            "One per line, format:  wrong >> right",
+            'Click "+ Add correction" to create a rule.',
             y, W, lines=2,
         )
-        self._fixups_tv, y = self._add_text_area(content, y - 4, W, 120)
-        lines = [f'{f["from"]} >> {f["to"]}' for f in settings.fixups]
-        self._fixups_tv.setString_("\n".join(lines))
-        y -= 18
+        scroll_h = 110
+        doc_w = W - PAD * 2 - 20  # account for vertical scroll bar
+        fixups_scroll = NSScrollView.alloc().initWithFrame_(
+            ((PAD, y - scroll_h), (W - PAD * 2, scroll_h))
+        )
+        fixups_scroll.setHasVerticalScroller_(True)
+        fixups_scroll.setBorderType_(2)  # NSBezelBorder
+        doc_view = _FlippedView.alloc().initWithFrame_(((0, 0), (doc_w, 40)))
+        fixups_scroll.setDocumentView_(doc_view)
+        content.addSubview_(fixups_scroll)
+        self._fixups_doc = doc_view
+        self._fixups_rows = []
+        for f in settings.fixups:
+            self._build_fixup_row(f.get("from", ""), f.get("to", ""))
+        self._relayout_fixup_rows()
+        y -= scroll_h + 8
+
+        add_fixup_btn = NSButton.alloc().initWithFrame_(
+            ((PAD, y - 26), (150, 26))
+        )
+        add_fixup_btn.setTitle_("+ Add correction")
+        add_fixup_btn.setBezelStyle_(1)
+        add_fixup_btn.setTarget_(self)
+        add_fixup_btn.setAction_("addFixupClicked:")
+        content.addSubview_(add_fixup_btn)
+        y -= 34
 
         # --- Save button + saved-feedback label ---
         btn_w, btn_h = 90, 30
@@ -361,11 +399,17 @@ class _PrefsController(NSObject):
             self._hotkey_popup.selectItemWithTitle_(settings.hotkey)
         if self._style_popup is not None:
             self._style_popup.selectItemWithTitle_(settings.style)
-        if self._vocab_tv is not None:
-            self._vocab_tv.setString_("\n".join(settings.vocab))
-        if self._fixups_tv is not None:
-            lines = [f'{f["from"]} >> {f["to"]}' for f in settings.fixups]
-            self._fixups_tv.setString_("\n".join(lines))
+        if self._vocab_tokens is not None:
+            self._vocab_tokens.setObjectValue_(list(settings.vocab))
+        if self._fixups_doc is not None:
+            # Wipe existing row widgets, rebuild from settings
+            for row in self._fixups_rows:
+                for widget in (row["from"], row["arrow"], row["to"], row["remove"]):
+                    widget.removeFromSuperview()
+            self._fixups_rows = []
+            for f in settings.fixups:
+                self._build_fixup_row(f.get("from", ""), f.get("to", ""))
+            self._relayout_fixup_rows()
 
     def saveClicked_(self, sender):
         self._commit()
@@ -391,35 +435,31 @@ class _PrefsController(NSObject):
 
     def _commit(self):
         # Hotkey
-        h = str(self._hotkey_popup.titleOfSelectedItem())
-        if h in HOTKEY_MODES:
-            settings.hotkey = h
+        if self._hotkey_popup is not None:
+            h = str(self._hotkey_popup.titleOfSelectedItem())
+            if h in HOTKEY_MODES:
+                settings.hotkey = h
 
         # Style
-        settings.style = str(self._style_popup.titleOfSelectedItem())
+        if self._style_popup is not None:
+            settings.style = str(self._style_popup.titleOfSelectedItem())
 
-        # Vocabulary
-        text = str(self._vocab_tv.string())
-        settings.vocab = [l.strip() for l in text.split("\n") if l.strip()]
+        # Vocabulary (NSTokenField objectValue is an NSArray of strings)
+        if self._vocab_tokens is not None:
+            tokens = self._vocab_tokens.objectValue() or []
+            settings.vocab = [str(t).strip() for t in tokens if str(t).strip()]
 
-        # Corrections
-        text = str(self._fixups_tv.string())
+        # Corrections (row widgets)
         settings.fixups = []
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            sep = ">>" if ">>" in line else "\u2192" if "\u2192" in line else None
-            if sep is None:
-                continue
-            parts = line.split(sep, 1)
-            f, t = parts[0].strip(), parts[1].strip()
+        for row in self._fixups_rows:
+            f = str(row["from"].stringValue()).strip()
+            t = str(row["to"].stringValue()).strip()
             if f and t:
                 settings.fixups.append({"from": f, "to": t})
 
         settings.save()
 
-    def _separator(self, parent, y, w):
+    def _add_separator(self, parent, y, w):
         PAD = 20
         sep = NSBox.alloc().initWithFrame_(
             ((PAD, y - 10), (w - PAD * 2, 1))
@@ -467,23 +507,111 @@ class _PrefsController(NSObject):
         parent.addSubview_(label)
         return y - h - 4
 
-    def _add_text_area(self, parent, y, w, h):
-        PAD = 20
-        scroll = NSScrollView.alloc().initWithFrame_(
-            ((PAD, y - h), (w - PAD * 2, h))
-        )
-        scroll.setHasVerticalScroller_(True)
-        scroll.setBorderType_(2)  # NSBezelBorder
+    # --- Corrections row management ---
 
-        cs = scroll.contentSize()
-        tv = NSTextView.alloc().initWithFrame_(((0, 0), (cs.width, cs.height)))
-        tv.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12, 0))
-        tv.setVerticallyResizable_(True)
-        tv.setHorizontallyResizable_(False)
-        tv.textContainer().setWidthTracksTextView_(True)
-        scroll.setDocumentView_(tv)
-        parent.addSubview_(scroll)
-        return tv, y - h
+    def _build_fixup_row(self, from_text="", to_text=""):
+        """Create widgets for one correction row. Caller must call
+        _relayout_fixup_rows() after to position them."""
+        doc = self._fixups_doc
+        if doc is None:
+            return
+        doc_w = doc.frame().size.width
+        row_h = 22
+        arrow_w = 22
+        remove_w = 26
+        pad = 6
+        # Split remaining width between from and to fields 50/50
+        fields_w = doc_w - arrow_w - remove_w - pad * 4
+        from_w = max(60, int(fields_w * 0.5))
+        to_w = max(60, fields_w - from_w)
+
+        x = pad
+        from_field = NSTextField.alloc().initWithFrame_(
+            ((x, 0), (from_w, row_h))
+        )
+        from_field.setStringValue_(from_text)
+        try:
+            from_field.cell().setPlaceholderString_("wrong")
+        except Exception:
+            pass
+        doc.addSubview_(from_field)
+        x += from_w + pad
+
+        arrow = NSTextField.alloc().initWithFrame_(
+            ((x, 2), (arrow_w, row_h - 4))
+        )
+        arrow.setStringValue_("→")
+        arrow.setBezeled_(False)
+        arrow.setDrawsBackground_(False)
+        arrow.setEditable_(False)
+        arrow.setSelectable_(False)
+        arrow.setAlignment_(2)  # NSTextAlignmentCenter
+        arrow.setTextColor_(NSColor.secondaryLabelColor())
+        doc.addSubview_(arrow)
+        x += arrow_w + pad
+
+        to_field = NSTextField.alloc().initWithFrame_(
+            ((x, 0), (to_w, row_h))
+        )
+        to_field.setStringValue_(to_text)
+        try:
+            to_field.cell().setPlaceholderString_("right")
+        except Exception:
+            pass
+        doc.addSubview_(to_field)
+        x += to_w + pad
+
+        remove_btn = NSButton.alloc().initWithFrame_(
+            ((x, 0), (remove_w, row_h))
+        )
+        remove_btn.setTitle_("×")
+        remove_btn.setBezelStyle_(1)
+        remove_btn.setTarget_(self)
+        remove_btn.setAction_("removeFixupClicked:")
+        doc.addSubview_(remove_btn)
+
+        self._fixups_rows.append({
+            "from": from_field,
+            "arrow": arrow,
+            "to": to_field,
+            "remove": remove_btn,
+        })
+
+    def _relayout_fixup_rows(self):
+        doc = self._fixups_doc
+        if doc is None:
+            return
+        stride = 28  # row_h (22) + gap (6)
+        for i, row in enumerate(self._fixups_rows):
+            base_y = i * stride
+            for key, w in row.items():
+                frame = w.frame()
+                if key == "arrow":
+                    w.setFrameOrigin_((frame.origin.x, base_y + 2))
+                else:
+                    w.setFrameOrigin_((frame.origin.x, base_y))
+        doc_w = doc.frame().size.width
+        new_h = max(len(self._fixups_rows) * stride, 40)
+        doc.setFrameSize_((doc_w, new_h))
+
+    def addFixupClicked_(self, sender):
+        self._build_fixup_row("", "")
+        self._relayout_fixup_rows()
+        # Scroll the newly added row into view
+        if self._fixups_rows:
+            last = self._fixups_rows[-1]["from"]
+            self._fixups_doc.scrollRectToVisible_(last.frame())
+            # Focus the new from-field so the user can start typing immediately
+            self._window.makeFirstResponder_(last)
+
+    def removeFixupClicked_(self, sender):
+        for i, row in enumerate(self._fixups_rows):
+            if row["remove"] == sender:
+                for widget in (row["from"], row["arrow"], row["to"], row["remove"]):
+                    widget.removeFromSuperview()
+                del self._fixups_rows[i]
+                self._relayout_fixup_rows()
+                return
 
     def windowShouldClose_(self, sender):
         # Auto-save on close as a safety net.
@@ -762,10 +890,10 @@ class LokaVox:
                     self._on_ctrl_up()
                 return event  # Pass through — Control is a shared modifier
 
-            # Control+Backtick for toggle
+            # Control+Escape for toggle
             if (
                 event_type == Quartz.kCGEventKeyDown
-                and keycode == KEYCODE_BACKTICK
+                and keycode == KEYCODE_ESCAPE
                 and (flags & Quartz.kCGEventFlagMaskControl)
             ):
                 self._on_toggle()
@@ -835,7 +963,7 @@ class LokaVox:
         # If toggle_active, ignore Ctrl release (user released after Ctrl+`)
 
     def _on_toggle(self):
-        # Ctrl+Backtick pressed: toggle recording regardless of PTT state
+        # Ctrl+Escape pressed: toggle recording regardless of PTT state
         self._cancel_ptt_start()
         if self.transcribing:
             return
@@ -891,7 +1019,7 @@ class LokaVox:
         print("LokaVox ready.")
         if settings.hotkey == HOTKEY_CONTROL:
             print("  Hold Control → hold-to-talk (250ms before recording starts)")
-            print("  Control + ` → toggle recording on/off")
+            print("  Control + Escape → toggle recording on/off")
         else:
             print("  Hold F5 (dictation key) → hold-to-talk")
             print("  Double-tap F5 → toggle recording on/off")
@@ -908,7 +1036,7 @@ class LokaVox:
 
         # CGEventTap — intercepts keyboard events. FlagsChanged is required
         # for Control-mode modifier detection; KeyDown/KeyUp for F5 and for
-        # Control+Backtick / cancel-on-other-key.
+        # Control+Escape / cancel-on-other-key.
         mask = (
             Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
