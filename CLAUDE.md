@@ -36,7 +36,9 @@ resources/
     Resources/
       AppIcon.icns                          # Copied by install.sh
 ~/.local/share/lokavox/venv/                # Python venv
+~/.local/share/lokavox/settings.json            # User preferences
 ~/.local/share/whisper/ggml-large-v3-turbo.bin  # Whisper model (~1.6GB)
+~/Library/LaunchAgents/com.local.lokavox.plist  # Auto-start (created by Preferences toggle)
 ```
 
 ## Critical Rules
@@ -50,14 +52,13 @@ resources/
 - **Microphone** → LokaVox.app (sox audio capture)
 
 ## Auto-Start
-Added to Login Items (alongside Raycast, Rectangle, etc.). Launches at login, no terminal needed.
+Managed via LaunchAgent plist (`~/Library/LaunchAgents/com.local.lokavox.plist`), toggled in Preferences → "Launch at Login". Uses `open -a` to launch the .app — survives re-codesigning (unlike Login Items, which break when the app signature changes).
 
 ## Dependencies
 - Homebrew: `whisper-cpp`, `sox`
 - Python venv: `pyobjc-framework-Quartz`, `pyobjc-framework-Cocoa`
 
 ## Future Enhancements (not yet implemented)
-- **Custom vocabulary**: Add `--prompt` flag to whisper-cli call in `transcribe()` to prime the model with domain-specific terms
 - **Move to another Mac**: Run CLAUDE-CODE-PROMPT.md setup on new machine, copy .app bundle, grant permissions
 - **Different trigger key**: Change `KEYCODE_DICTATION` constant. Use key sniffer script to find any key's code:
   `~/.local/share/lokavox/venv/bin/python3 /tmp/key_sniffer.py`
@@ -70,4 +71,5 @@ Added to Login Items (alongside Raycast, Rectangle, etc.). Launches at login, no
 - **"Thank you" on short press** = adjust `MIN_RECORDING_SECS` or extend `_HALLUCINATIONS` set
 - **Dictation key triggers macOS** = app not running or event tap disabled; restart app
 - **Dictation key opens Apple Music** = old bug, was caused by MRMediaRemoteSendCommand(PAUSE) launching Music as default handler when nothing was playing. Fixed by switching to targeted AppleScript.
-- **Two instances at login** = both LaunchAgent AND Login Items were active. LaunchAgent deleted, Login Items only now.
+- **Two instances at login** = both LaunchAgent AND Login Items were active. Now using LaunchAgent only (managed via Preferences toggle). Remove any stale Login Items entry from System Settings → General → Login Items.
+- **Not launching at login after re-codesign** = Login Items break when app signature changes. Switch to LaunchAgent via Preferences → "Launch at Login" (this is now the default mechanism).

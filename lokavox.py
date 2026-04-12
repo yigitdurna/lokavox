@@ -76,6 +76,10 @@ SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 _DEFAULT_VOCAB = []
 _DEFAULT_FIXUPS = []
 
+# Launch at Login via LaunchAgent (survives re-codesigning, unlike Login Items)
+_LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
+_LAUNCH_AGENT_FILE = _LAUNCH_AGENT_DIR / "com.local.lokavox.plist"
+
 # macOS key codes
 KEYCODE_LEFT_CTRL = 59
 KEYCODE_RIGHT_CTRL = 62
@@ -221,6 +225,43 @@ class Settings:
 settings = Settings()
 
 
+# --- Login Item Management ---
+
+def _login_item_enabled():
+    """Check if launch-at-login is enabled (LaunchAgent plist exists)."""
+    return _LAUNCH_AGENT_FILE.exists()
+
+
+def _set_login_item(enabled):
+    """Enable or disable launch-at-login via LaunchAgent."""
+    if enabled:
+        _LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        app_path = Path.home() / "Applications" / "LokaVox.app"
+        plist = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+            ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
+            '<dict>\n'
+            '    <key>Label</key>\n'
+            '    <string>com.local.lokavox</string>\n'
+            '    <key>ProgramArguments</key>\n'
+            '    <array>\n'
+            '        <string>open</string>\n'
+            '        <string>-a</string>\n'
+            f'        <string>{app_path}</string>\n'
+            '    </array>\n'
+            '    <key>RunAtLoad</key>\n'
+            '    <true/>\n'
+            '</dict>\n'
+            '</plist>\n'
+        )
+        _LAUNCH_AGENT_FILE.write_text(plist)
+    else:
+        if _LAUNCH_AGENT_FILE.exists():
+            _LAUNCH_AGENT_FILE.unlink()
+
+
 class _AppDelegate(NSObject):
     """Prevent app from quitting when preferences window closes."""
 
@@ -252,6 +293,7 @@ class _PrefsController(NSObject):
         self._fixups_rows = []
         self._saved_label = None
         self._saved_timer = None
+        self._login_checkbox = None
         return self
 
     def showWindow_(self, sender):
@@ -261,7 +303,7 @@ class _PrefsController(NSObject):
             NSApp.activateIgnoringOtherApps_(True)
             return
 
-        W, H = 520, 760
+        W, H = 520, 810
         PAD = 20
         style = 1 | 2  # Titled | Closable
 
@@ -364,6 +406,17 @@ class _PrefsController(NSObject):
         content.addSubview_(add_fixup_btn)
         y -= 34
 
+        # --- Launch at Login ---
+        y = self._add_separator(content, y, W)
+        self._login_checkbox = NSButton.alloc().initWithFrame_(
+            ((PAD, y - 22), (W - PAD * 2, 22))
+        )
+        self._login_checkbox.setButtonType_(3)  # NSSwitchButton
+        self._login_checkbox.setTitle_("Launch at Login")
+        self._login_checkbox.setState_(1 if _login_item_enabled() else 0)
+        content.addSubview_(self._login_checkbox)
+        y -= 34
+
         # --- Save button + saved-feedback label ---
         btn_w, btn_h = 90, 30
         save_btn = NSButton.alloc().initWithFrame_(
@@ -410,6 +463,8 @@ class _PrefsController(NSObject):
             for f in settings.fixups:
                 self._build_fixup_row(f.get("from", ""), f.get("to", ""))
             self._relayout_fixup_rows()
+        if self._login_checkbox is not None:
+            self._login_checkbox.setState_(1 if _login_item_enabled() else 0)
 
     def saveClicked_(self, sender):
         self._commit()
@@ -458,6 +513,10 @@ class _PrefsController(NSObject):
                 settings.fixups.append({"from": f, "to": t})
 
         settings.save()
+
+        # Launch at Login
+        if self._login_checkbox is not None:
+            _set_login_item(self._login_checkbox.state() == 1)
 
     def _add_separator(self, parent, y, w):
         PAD = 20
