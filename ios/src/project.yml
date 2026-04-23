@@ -1,0 +1,73 @@
+name: LokaVox
+options:
+  deploymentTarget:
+    iOS: "18.0"
+  groupSortPosition: top
+  generateEmptyDirectories: true
+  developmentLanguage: en
+
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    # DEVELOPMENT_TEAM intentionally omitted — Xcode prompts the user to
+    # select a team (incl. personal-team for free accounts) on first open.
+
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit.git
+    from: "0.14.1"
+
+targets:
+  LokaVox:
+    type: application
+    platform: iOS
+    sources:
+      - path: LokaVox
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lokavox.app
+        PRODUCT_NAME: LokaVox
+        INFOPLIST_FILE: LokaVox/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: LokaVox/Resources/LokaVox.entitlements
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+    dependencies:
+      - package: WhisperKit
+      - target: LokaVoxKeyboard
+
+  LokaVoxKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: LokaVoxKeyboard
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lokavox.app.keyboard
+        PRODUCT_NAME: LokaVoxKeyboard
+        INFOPLIST_FILE: LokaVoxKeyboard/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: LokaVoxKeyboard/Resources/LokaVoxKeyboard.entitlements
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SKIP_INSTALL: true
+        TARGETED_DEVICE_FAMILY: "1"
+
+schemes:
+  LokaVox:
+    build:
+      targets:
+        LokaVox: all
+        LokaVoxKeyboard: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+    test:
+      config: Debug
+    analyze:
+      config: Debug
