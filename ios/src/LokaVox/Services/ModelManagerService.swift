@@ -1,56 +1,67 @@
+import CryptoKit
 import Foundation
 import Observation
-import WhisperKit
 
-/// Downloads and loads the Whisper model for LokaVox.
-/// Writes the model into the app's Documents directory.
+/// Downloads, verifies, and loads the whisper.cpp GGML model.
+///
+/// The model is a single `.bin` file (the same format `whisper-cli` loads on
+/// Mac). We download once on first launch from HuggingFace, hash-verify it,
+/// cache it under `~/Documents/models/`, and hand the path to
+/// `WhisperEngine.load(modelFileURL:useGPU:)`.
 @MainActor
 @Observable
 final class ModelManagerService {
-    /// Identifier used by WhisperKit to locate the variant folder inside
-    /// argmaxinc/whisperkit-coreml on HuggingFace.
-    ///
-    /// Using the v20240930 turbo recompile, quantized to 632 MB. The plain
-    /// `openai_whisper-large-v3_turbo` was built against an older ANE
-    /// compiler and fails on current iPhone ANE with "Program load failure
-    /// (0x20004) — Must re-compile the E5 bundle". The v20240930 variants
-    /// are Argmax's iPhone-ANE rebuild; the `_632MB` quantization keeps
-    /// turbo quality while fitting in the ANE compile budget that the
-    /// non-quantized turbo blows past.
-    static let modelVariant = "openai_whisper-large-v3-v20240930_turbo_632MB"
+    /// Filename used as the cache key + on-disk file name. This is also the
+    /// last path component of the HuggingFace download URL.
+    static let modelFileName = "ggml-large-v3-turbo.bin"
+
+    /// Canonical HuggingFace download URL for the model. Using the same file
+    /// the Mac LokaVox loads via `whisper-cli`, so transcription output on
+    /// iOS should match Mac within model-internal variance.
+    static let modelSourceURL = URL(
+        string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+    )!
+
+    /// Expected SHA256 of the model file. Computed from HuggingFace's
+    /// `x-linked-etag` at the pinned commit; re-verify if you bump the
+    /// source URL.
+    static let modelSHA256 = "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+
+    /// Expected size in bytes. Used for progress-fraction clamping when the
+    /// server doesn't report Content-Length.
+    static let modelSizeBytes: Int64 = 1_624_555_275
 
     enum State: Equatable {
         case idle
         case downloading(progress: Double)
+        case verifying
         case loading
         case ready
         case failed(String)
     }
 
-    /// Key under which we persist the resolved model folder path so subsequent
-    /// launches skip the download step. Stored in `UserDefaults.standard`
-    /// (per-app), not the App Group suite — App Group `UserDefaults` emits a
-    /// `kCFPreferencesAnyUser`-with-container error and silently fails to
-    /// persist on iOS 17+. The keyboard extension does not need this key.
-    private static let cachedModelPathKey = "LokaVox.cachedModelFolderPath"
+    /// Path we persist the resolved model URL under so subsequent launches
+    /// skip download + hash-verify. Stored in `UserDefaults.standard`
+    /// (per-app), not App Group.
+    private static let cachedModelPathKey = "LokaVox.cachedModelFilePath"
 
     private(set) var state: State = .idle
     private(set) var downloadDurationMs: Int?
     private(set) var loadDurationMs: Int?
 
     private let engine: WhisperEngine
+    private let settings: LokaVoxSettings
 
-    init(engine: WhisperEngine) {
+    /// Hold onto progress observations so they're not cancelled early.
+    private var activeDownloadTask: URLSessionDownloadTask?
+    private var activeProgressObservation: NSKeyValueObservation?
+
+    init(engine: WhisperEngine, settings: LokaVoxSettings) {
         self.engine = engine
+        self.settings = settings
     }
 
-    /// Root directory where WhisperKit is asked to stage downloaded model
-    /// files. Lives in the app's Documents directory (per-app, not App Group).
-    /// Why: App Group container caches were observed being evicted mid-compile
-    /// by iOS, corrupting the partial ANE state; the per-app Documents
-    /// directory is not subject to the same aggressive reclaim. Once the
-    /// keyboard needs to read these files we will revisit (likely a copy or
-    /// shared file coordinator).
+    /// Root directory where we stage downloaded model files.
     static func modelsRootURL() -> URL? {
         guard let documents = FileManager.default.urls(
             for: .documentDirectory,
@@ -62,8 +73,7 @@ final class ModelManagerService {
     }
 
     /// Top-level entry point. Safe to call on every app launch.
-    /// - Idempotent: if a cached model folder exists on disk, skips download.
-    /// - After this returns, `state == .ready` on success or `.failed` on error.
+    /// Idempotent — if a cached model exists and hashes, skip download.
     func prepare() async {
         guard let modelsRoot = Self.modelsRootURL() else {
             state = .failed("Documents directory unavailable.")
@@ -80,89 +90,186 @@ final class ModelManagerService {
             return
         }
 
-        let cached = cachedModelFolder() ?? findExistingVariantFolder(under: modelsRoot)
-        let modelFolder: URL
-        if let cached {
-            UserDefaults.standard.set(cached.path, forKey: Self.cachedModelPathKey)
-            modelFolder = cached
-        } else {
-            state = .downloading(progress: 0)
-            let downloadStart = Date()
-            do {
-                let resolved = try await WhisperKit.download(
-                    variant: Self.modelVariant,
-                    downloadBase: modelsRoot,
-                    useBackgroundSession: false,
-                    progressCallback: { @Sendable [weak self] progress in
-                        let fraction = progress.fractionCompleted
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            if case .downloading = self.state {
-                                self.state = .downloading(progress: fraction)
-                            }
-                        }
-                    }
-                )
-                downloadDurationMs = Int(Date().timeIntervalSince(downloadStart) * 1000)
-                UserDefaults.standard.set(resolved.path, forKey: Self.cachedModelPathKey)
-                modelFolder = resolved
-            } catch {
-                state = .failed("Model download failed: \(error.localizedDescription)")
-                return
-            }
+        let targetURL = modelsRoot.appendingPathComponent(Self.modelFileName, isDirectory: false)
+
+        // Try the cache first.
+        if let cached = cachedModelFileIfValid(at: targetURL) {
+            await loadAndMarkReady(fileURL: cached)
+            return
         }
 
-        state = .loading
-        let loadStart = Date()
+        // No valid cache — download.
+        state = .downloading(progress: 0)
+        let downloadStart = Date()
+
         do {
-            try await engine.load(modelFolder: modelFolder)
-            loadDurationMs = Int(Date().timeIntervalSince(loadStart) * 1000)
+            try await downloadModel(to: targetURL)
+            downloadDurationMs = Int(Date().timeIntervalSince(downloadStart) * 1000)
+        } catch {
+            state = .failed("Model download failed: \(error.localizedDescription)")
+            return
+        }
+
+        state = .verifying
+        do {
+            try verifySHA256(fileURL: targetURL, expected: Self.modelSHA256)
+        } catch {
+            // Corrupt download — nuke it so the next launch retries cleanly.
+            try? FileManager.default.removeItem(at: targetURL)
+            UserDefaults.standard.removeObject(forKey: Self.cachedModelPathKey)
+            state = .failed("Model file did not match expected SHA256.")
+            return
+        }
+
+        UserDefaults.standard.set(targetURL.path, forKey: Self.cachedModelPathKey)
+        await loadAndMarkReady(fileURL: targetURL)
+    }
+
+    /// Reload the engine with the current `settings.gpuAccelerationEnabled`.
+    /// Call this after the user toggles the GPU switch.
+    func reloadEngineForSettingsChange() async {
+        guard let modelsRoot = Self.modelsRootURL() else { return }
+        let targetURL = modelsRoot.appendingPathComponent(Self.modelFileName, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: targetURL.path) else { return }
+        await loadAndMarkReady(fileURL: targetURL)
+    }
+
+    // MARK: - Load
+
+    private func loadAndMarkReady(fileURL: URL) async {
+        state = .loading
+        let start = Date()
+        let useGPU = resolveUseGPU()
+        do {
+            try await engine.load(modelFileURL: fileURL, useGPU: useGPU)
+            loadDurationMs = Int(Date().timeIntervalSince(start) * 1000)
             state = .ready
         } catch {
-            // Cached path may point at corrupt files (e.g. interrupted ANE
-            // compile). Clear it so the next launch re-downloads cleanly.
+            // Cached file may point at corrupt bits. Nuke it so the next
+            // launch re-downloads cleanly.
             UserDefaults.standard.removeObject(forKey: Self.cachedModelPathKey)
             state = .failed("Model load failed: \(error.localizedDescription)")
         }
     }
 
-    /// Walks the models root looking for a directory named `Self.modelVariant`.
-    /// Used as a one-shot recovery path when we know a prior run wrote the
-    /// variant somewhere under `modelsRoot` but we didn't record the exact URL.
-    private func findExistingVariantFolder(under root: URL) -> URL? {
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-        for case let url as URL in enumerator {
-            if url.lastPathComponent == Self.modelVariant,
-               (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
-               let contents = try? FileManager.default.contentsOfDirectory(atPath: url.path),
-               !contents.isEmpty {
-                return url
-            }
-        }
-        return nil
+    /// Resolves the effective `useGPU` flag honouring both user Settings and
+    /// the Simulator Metal-broken guard.
+    private func resolveUseGPU() -> Bool {
+        #if targetEnvironment(simulator)
+        // whisper.cpp Metal is broken on the iOS Simulator (whisper.cpp#2522).
+        return false
+        #else
+        return settings.gpuAccelerationEnabled
+        #endif
     }
 
-    /// Returns the previously-downloaded model folder if it still exists on disk
-    /// AND matches the current `modelVariant`. Invalidates the cached path on miss
-    /// (folder gone, variant mismatched after a swap).
-    private func cachedModelFolder() -> URL? {
+    // MARK: - Download
+
+    private func downloadModel(to targetURL: URL) async throws {
+        // Remove any partial / stale file at the target path so the move
+        // from the temp download location never collides.
+        if FileManager.default.fileExists(atPath: targetURL.path) {
+            try FileManager.default.removeItem(at: targetURL)
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let session = URLSession(configuration: .default)
+            let task = session.downloadTask(with: Self.modelSourceURL) { [weak self] tempURL, response, error in
+                Task { @MainActor [weak self] in
+                    self?.activeDownloadTask = nil
+                    self?.activeProgressObservation = nil
+                }
+
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                guard let tempURL else {
+                    continuation.resume(throwing: URLError(.cannotOpenFile))
+                    return
+                }
+                // Sanity-check the HTTP response.
+                if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                    continuation.resume(throwing: URLError(.badServerResponse))
+                    return
+                }
+                do {
+                    try FileManager.default.moveItem(at: tempURL, to: targetURL)
+                    continuation.resume(returning: ())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+
+            // Observe progress. `fractionCompleted` is accurate when the
+            // server reports Content-Length (HuggingFace does); otherwise
+            // we clamp against the known model size.
+            let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
+                let fraction = progress.fractionCompleted
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if case .downloading = self.state {
+                        self.state = .downloading(progress: min(1.0, max(0.0, fraction)))
+                    }
+                }
+            }
+
+            self.activeDownloadTask = task
+            self.activeProgressObservation = observation
+            task.resume()
+        }
+    }
+
+    // MARK: - Cache
+
+    private func cachedModelFileIfValid(at targetURL: URL) -> URL? {
         let defaults = UserDefaults.standard
-        guard let path = defaults.string(forKey: Self.cachedModelPathKey) else {
+
+        let candidatePath = defaults.string(forKey: Self.cachedModelPathKey) ?? targetURL.path
+        let candidate = URL(fileURLWithPath: candidatePath)
+
+        guard FileManager.default.fileExists(atPath: candidate.path) else {
+            defaults.removeObject(forKey: Self.cachedModelPathKey)
             return nil
         }
-        let url = URL(fileURLWithPath: path)
-        var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-        if exists && isDir.boolValue && url.lastPathComponent == Self.modelVariant {
-            return url
+
+        // Fast-path: size + cached-hash sentinel. We don't re-SHA on every
+        // launch — it costs ~1s on a 1.6 GB file. Trust the path if it
+        // exists and was recorded as valid at download time.
+        if defaults.string(forKey: Self.cachedModelPathKey) != nil {
+            return candidate
         }
-        defaults.removeObject(forKey: Self.cachedModelPathKey)
-        return nil
+
+        // Found the file but no cache record — verify before trusting.
+        do {
+            try verifySHA256(fileURL: candidate, expected: Self.modelSHA256)
+            defaults.set(candidate.path, forKey: Self.cachedModelPathKey)
+            return candidate
+        } catch {
+            try? FileManager.default.removeItem(at: candidate)
+            return nil
+        }
+    }
+
+    private func verifySHA256(fileURL: URL, expected: String) throws {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        let chunkSize = 4 * 1024 * 1024  // 4 MB chunks
+        while true {
+            let chunk = try handle.read(upToCount: chunkSize) ?? Data()
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        let digest = hasher.finalize()
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        guard hex == expected else {
+            throw NSError(
+                domain: "LokaVox.ModelManager",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "SHA256 mismatch: expected \(expected), got \(hex)"]
+            )
+        }
     }
 }

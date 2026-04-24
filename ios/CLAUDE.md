@@ -1,6 +1,6 @@
 # LokaVox iOS
 
-Local speech-to-text keyboard for iPhone, continuation of the LokaVox Mac app. Native Swift/SwiftUI. All transcription runs on-device via WhisperKit with Whisper large-v3-turbo.
+Local speech-to-text keyboard for iPhone, continuation of the LokaVox Mac app. Native Swift/SwiftUI. All transcription runs on-device via whisper.cpp (locally-built XCFramework) with `ggml-large-v3-turbo.bin` — the same model file the Mac app loads via `whisper-cli`.
 
 ## Sub-Agent Usage (Important)
 
@@ -27,7 +27,7 @@ This is a sibling product to `../lokavox.py`, sharing the LokaVox name, privacy 
 
 Three targets:
 
-1. **LokaVox app** (main) — holds WhisperKit model in memory, manages audio recording in background, writes transcribed text to App Group shared container. Has `UIBackgroundModes: audio` to keep the mic alive in Flow mode.
+1. **LokaVox app** (main) — holds the whisper.cpp context (~1.6 GB resident) in memory, manages audio recording in background, writes transcribed text to App Group shared container. Has `UIBackgroundModes: audio` to keep the mic alive in Flow mode.
 2. **LokaVoxKeyboard extension** — thin UI surface. Captures audio or triggers main app to capture, reads transcribed text from App Group, inserts into active text field via `textDocumentProxy.insertText()`. Memory budget ~70 MB — model CANNOT load here.
 3. **App Group shared container** (`group.com.lokavox.shared`) — UserDefaults + JSON files for IPC between main app and keyboard.
 
@@ -145,7 +145,7 @@ lokavox/ios/
 - Xcode 16+ (installed)
 - xcodegen for project generation (install: `brew install xcodegen`)
 - Test device: iPhone 16 Pro
-- Dependencies via SwiftPM: WhisperKit (argmaxinc/WhisperKit), nothing else unless justified
+- Dependencies: whisper.cpp via locally-built XCFramework committed at `ios/src/Vendor/whisper.xcframework/`. Regenerate with `ios/src/scripts/build-whisper-xcframework.sh` (pins upstream tag `v1.8.4`). No SwiftPM deps — upstream removed SPM support in March 2025 ([ggml-org/whisper.cpp#2869](https://github.com/ggml-org/whisper.cpp/issues/2869)).
 
 ## Build & Run
 
@@ -169,17 +169,28 @@ In Xcode on first open:
 ### Step 1 — Skeleton (DONE)
 Empty app + empty keyboard running on device. Verified by: main app launches without crash, keyboard appears in keyboard switcher, Full Access accepts-on, keyboard placeholder renders in Notes/Messages. No functional code yet.
 
-### Step 2 — In-app transcription (next)
-Main app only: WhisperKit model download UI, record button, transcribe, display result. No keyboard involvement. Measure cold-start latency.
+### Step 2 — In-app transcription (DONE)
+Main app only: model download UI, record button, transcribe, display result. No keyboard involvement.
 
-### Step 3 — Keyboard v0 (bounce-to-app)
-Simplest keyboard → main app → back path via URL scheme + App Group. Known rough UX; proves the IPC wiring.
+### Step 3 — Keyboard v0 (bounce-to-app) (DONE — 2026-04-24)
+Proven on iPhone 16 Pro. Mic tap in keyboard opens main app via SwiftUI `Link` (iOS 18+ killed every programmatic `openURL` path for keyboard extensions; only the system-dispatched `Link` survives — confirmed by KeyboardKit 10.4). IPC via App Group `UserDefaults` only (no JSON file — see [plan](~/.claude/plans/agile-seeking-ullman.md) §2 for rationale): generation counter for dedup, state machine `requested → recording → transcribing → done|error`. Keyboard drains on `viewWillAppear`/`viewDidAppear` + backup 0.5s Task-based poll (20s cap). `UIPasteboard.hasStrings` optimistic Full Access check. Transcript is editable in the main app (TextEditor, didSet → App Group). Keyboard has mic + space + return + backspace keys (system provides globe). Stuck-mic safeguard: main app auto-stops recording on `scenePhase → .background` during URL sessions.
 
-### Step 4 — Flow mode
-Long-lived AVAudioEngine in main app, keyboard flips state flags. Includes interruption handling (see Critical Rules #6) from the start.
+### Step 5 — Settings (DONE — 2026-04-24)
+Ported from Mac version ahead of Flow mode because user had existing vocab/corrections. Vocab (fed to Whisper via `initial_prompt`), find/replace corrections (word-boundary, case-insensitive, `\s+` for spaces — mirrors Mac regex), writing style (Standard/Lowercase), language picker (Auto / English / Turkish), Flow mode toggle + duration, GPU acceleration toggle. Persisted as JSON under `UserDefaults.standard` key `LokaVox.settings.v1`. Settings UI: gear icon in `ContentView` toolbar → `SettingsView` sheet.
 
-### Step 5 — Vocabulary + corrections
-Port from Mac LokaVox.
+### Step 4 — Flow mode (DONE — 2026-04-24)
+Long-lived AVAudioEngine in main app, keyboard flips state via Darwin notifications + App Group `SessionStore`. Interruption handling exits Flow cleanly. `UIBackgroundModes: audio` + active session keeps main app un-suspended so the keyboard's Darwin-notification wake works. `handleAppBackgrounded()` inverted — mic stays alive while Flow is active, killed only on timeout / interruption / manual End. Heartbeat + staleness detection in the keyboard handles Jetsam: keyboard falls back to cold `Link` URL-bounce on stale heartbeat. Non-Flow-active path still kills the mic on background (stuck-mic safeguard retained).
+
+### Step 6 — whisper.cpp engine swap (DONE — 2026-04-25)
+WhisperKit was swapped out for whisper.cpp. Reason: on iPhone 16 Pro / A18, WhisperKit only supports Argmax's weight-quantized CoreML variants (largest ~632 MB turbo) because the full-precision 1.6 GB turbo exceeds the ANE compile budget. Quantization measurably hurt Turkish and unclear-speech quality. whisper.cpp running on Metal loads the unquantized `ggml-large-v3-turbo.bin` — the exact same file the Mac app uses — with no quality compromise. Engine/model layer rewritten; keyboard, Flow, Settings, and audio capture untouched. CPU fallback wired in for iOS 26 background-Metal crash ([whisper.cpp#3531](https://github.com/ggml-org/whisper.cpp/issues/3531)) and exposed as user-visible Settings → Advanced → GPU acceleration toggle.
+
+### Known gotchas from step 6 tuning (all baked into current code)
+1. `language = nil + detect_language = true` silently returns zero segments on this build/model. Engine always passes a concrete language code; defaults to `"en"` when Settings → Language = Auto. Surfaced in Settings footer: non-English users must pick a language explicitly.
+2. `suppress_nst = true` and `flash_attn = true` both cause silent-zero-segments on this build. Disabled in `WhisperEngine.swift`.
+3. `.measurement` audio-session mode rejected some routing configurations with CoreAudio error 2003329396. Switched to `.default`. `engine.reset()` + single retry wraps transient CoreAudio failures in the start path.
+4. `greedy.best_of = 1` (default 5) for ~30% speed win on dictation clips.
+5. Whisper `initial_prompt` (vocab) biasing is soft — matches Mac behavior, no hard guarantees. Corrections run post-transcribe via word-boundary case-insensitive regex, mirroring Mac's `fixups_compiled()`. Hallucination denylist ported from Mac's `_HALLUCINATIONS` set.
+
 
 ## Testing Approach
 

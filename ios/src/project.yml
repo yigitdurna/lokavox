@@ -14,11 +14,6 @@ settings:
     # DEVELOPMENT_TEAM intentionally omitted — Xcode prompts the user to
     # select a team (incl. personal-team for free accounts) on first open.
 
-packages:
-  WhisperKit:
-    url: https://github.com/argmaxinc/WhisperKit.git
-    from: "0.14.1"
-
 targets:
   LokaVox:
     type: application
@@ -36,8 +31,14 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
-      - package: WhisperKit
+      # whisper.cpp via locally-built XCFramework. See
+      # scripts/build-whisper-xcframework.sh for rebuild instructions.
+      # Shipping the binary in the repo instead of a package dep because
+      # upstream removed SPM support in March 2025 (ggml-org#2869).
+      - framework: Vendor/whisper.xcframework
+        embed: true
       - target: LokaVoxKeyboard
 
   LokaVoxKeyboard:

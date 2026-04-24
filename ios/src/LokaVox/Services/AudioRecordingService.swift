@@ -3,13 +3,21 @@ import Foundation
 import os
 
 /// Records microphone audio at 16 kHz mono Float32 — Whisper's native format.
-/// Intentionally minimal for step 2: start, stop, return samples.
-/// Flow mode, audio-level metering, silence detection, and pause/resume
-/// are added in later steps.
+///
+/// Two usage modes:
+///
+/// 1. **End-to-end (step 2 / 3 URL-bounce path)** — `start()` acquires
+///    everything and begins capturing; `stop()` returns samples and tears
+///    the session down.
+/// 2. **Split lifecycle (step 4 Flow mode)** — `startEngine()` acquires the
+///    audio session + starts the engine but captures nothing. `installTap()`
+///    begins capturing; `drainSamples()` removes the tap and returns audio;
+///    `stopEngine()` releases the session. The engine stays running between
+///    segments inside a Flow window so first-sample latency is minimal.
 ///
 /// Interruption handling is present from the start (CLAUDE.md rule #6):
 /// on interruption the engine stops and any partial audio is discarded.
-/// The caller observes the failure via the delegate callback.
+/// The caller observes the failure via the `onInterruption` callback.
 final class AudioRecordingService: @unchecked Sendable {
 
     enum RecordingError: LocalizedError {
@@ -46,7 +54,12 @@ final class AudioRecordingService: @unchecked Sendable {
 
     private let samplesLock = OSAllocatedUnfairLock<[Float]>(initialState: [])
 
-    private var isRecording = false
+    /// Engine is running + audio session is active. A tap may or may not
+    /// be installed; see `isTapInstalled`.
+    private var isEngineRunning = false
+    /// A tap is installed on the input node and samples are flowing into
+    /// `samplesLock`.
+    private var isTapInstalled = false
 
     // Configured once when the first recording starts.
     private var interruptionObserver: NSObjectProtocol?
@@ -68,23 +81,55 @@ final class AudioRecordingService: @unchecked Sendable {
         await AVAudioApplication.requestRecordPermission()
     }
 
-    // MARK: - Recording
+    // MARK: - Recording — end-to-end (step 2 / 3 URL-bounce path)
 
+    /// Acquire everything and begin capturing in one call. Symmetric with
+    /// `stop()`. Used by the step-3 URL-bounce flow where one tap = one
+    /// recording.
     func start() async throws {
-        guard !isRecording else { return }
+        try await startEngine()
+        try installTap()
+    }
+
+    /// Stop capturing, tear down the engine + session, return samples.
+    func stop() -> [Float] {
+        let samples = drainSamples()
+        stopEngine()
+        return samples
+    }
+
+    // MARK: - Recording — split lifecycle (step 4 Flow mode)
+
+    /// Acquire the audio session and start the engine without installing a
+    /// tap. After this returns, the engine is running and the mic hardware
+    /// is active but no samples are being captured. Call `installTap()` to
+    /// begin a segment.
+    func startEngine() async throws {
+        guard !isEngineRunning else { return }
 
         guard AVAudioApplication.shared.recordPermission == .granted else {
             throw RecordingError.permissionDenied
         }
 
-        // Configure the session. `.record` is enough for step 2; no playback mixing yet.
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.record, mode: .measurement, options: [])
+            // `.default` mode rather than `.measurement`. `.measurement`
+            // disables iOS's signal-processing stack (AGC, noise-suppress,
+            // echo-cancel) — good on paper for whisper, but brittle in
+            // practice: it rejects some device + BT routing configurations
+            // and the engine throws CoreAudio error 2003329396 on start.
+            // `.default` is permissive and whisper handles mild iOS AGC fine.
+            try session.setCategory(.record, mode: .default, options: [])
             try session.setActive(true, options: [])
         } catch {
             throw RecordingError.sessionConfigurationFailed(error.localizedDescription)
         }
+
+        // Reset the engine before reuse. When the same AVAudioEngine
+        // instance has been started + stopped across multiple session
+        // reconfigurations, the input node caches stale format state and
+        // engine.start() throws 2003329396. `reset()` clears that cache.
+        engine.reset()
 
         let inputNode = engine.inputNode
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
@@ -104,46 +149,89 @@ final class AudioRecordingService: @unchecked Sendable {
         }
         self.converter = converter
 
-        samplesLock.withLock { $0.removeAll(keepingCapacity: true) }
-
-        // Install input tap. Tap callback runs on an AVFoundation thread; we do not hop.
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: hardwareFormat) { [weak self] buffer, _ in
-            self?.process(inputBuffer: buffer)
-        }
-
         engine.prepare()
         do {
             try engine.start()
         } catch {
-            inputNode.removeTap(onBus: 0)
-            throw RecordingError.engineStartFailed(error.localizedDescription)
+            // Retry once after a short delay — CoreAudio sometimes returns
+            // transient errors when the audio route is still settling after
+            // setActive. If the second attempt also fails, give up with the
+            // original error.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            engine.reset()
+            engine.prepare()
+            do {
+                try engine.start()
+            } catch {
+                throw RecordingError.engineStartFailed(error.localizedDescription)
+            }
         }
 
-        isRecording = true
+        isEngineRunning = true
     }
 
-    /// Stop recording and return the accumulated 16 kHz mono Float32 samples.
-    /// Deactivates the audio session.
-    func stop() -> [Float] {
-        guard isRecording else { return [] }
-        isRecording = false
+    /// Stop the engine and deactivate the audio session. If a tap is still
+    /// installed, pending samples are discarded.
+    func stopEngine() {
+        if isTapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            isTapInstalled = false
+            samplesLock.withLock { $0.removeAll(keepingCapacity: false) }
+        }
 
-        engine.inputNode.removeTap(onBus: 0)
+        guard isEngineRunning else { return }
+        isEngineRunning = false
+
         engine.stop()
-
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
 
-        let out = samplesLock.withLock { state -> [Float] in
+        converter = nil
+        targetFormat = nil
+    }
+
+    /// Install the input tap and start accumulating samples. Requires the
+    /// engine to be running (`startEngine()` first). Resets any previously
+    /// captured samples.
+    func installTap() throws {
+        guard isEngineRunning else {
+            throw RecordingError.engineStartFailed("Engine is not running.")
+        }
+        guard !isTapInstalled else { return }
+
+        let inputNode = engine.inputNode
+        let hardwareFormat = inputNode.outputFormat(forBus: 0)
+
+        samplesLock.withLock { $0.removeAll(keepingCapacity: true) }
+
+        // Tap callback runs on an AVFoundation thread; we do not hop.
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: hardwareFormat) { [weak self] buffer, _ in
+            self?.process(inputBuffer: buffer)
+        }
+        isTapInstalled = true
+    }
+
+    /// Remove the tap and return the accumulated 16 kHz mono Float32 samples.
+    /// The engine stays running — ready for the next segment. Safe to call
+    /// even if no tap is installed (returns `[]`).
+    func drainSamples() -> [Float] {
+        guard isTapInstalled else { return [] }
+        engine.inputNode.removeTap(onBus: 0)
+        isTapInstalled = false
+
+        return samplesLock.withLock { state -> [Float] in
             let copy = state
             state.removeAll(keepingCapacity: false)
             return copy
         }
-
-        converter = nil
-        targetFormat = nil
-
-        return out
     }
+
+    /// True while the engine is running (between `startEngine()` and
+    /// `stopEngine()`). FlowSessionManager reads this to know whether it
+    /// needs a fresh acquisition.
+    var engineIsRunning: Bool { isEngineRunning }
+
+    /// True while samples are actively being captured.
+    var tapIsInstalled: Bool { isTapInstalled }
 
     // MARK: - Private
 
@@ -206,12 +294,14 @@ final class AudioRecordingService: @unchecked Sendable {
             switch type {
             case .began:
                 // Discard partial audio; let caller know we lost the session.
-                _ = self.stop()
+                // stopEngine() also yanks any installed tap, so a Flow-mode
+                // in-progress segment is cleanly torn down.
+                self.stopEngine()
                 if let handler = self.onInterruption {
                     Task { @MainActor in handler() }
                 }
             case .ended:
-                // Do nothing — step 2 does not auto-resume; user re-taps record.
+                // Do nothing — step 2/3/4 do not auto-resume; user re-taps mic.
                 break
             @unknown default:
                 break
