@@ -320,6 +320,11 @@ actor WhisperEngine {
         let resolvedLang = resolveLanguage(languageCode)
         params.detect_language = false
 
+        // Speed: default is 5 candidate sequences per token. For dictation
+        // (short clips, speaker clarity, no beam search needed) 1 is enough
+        // and ~30% faster per transcribe with negligible quality difference.
+        params.greedy.best_of = 1
+
         // Pass `language` and `initial_prompt` via nested `withCString`
         // closures — the canonical upstream pattern (see
         // `examples/whisper.swiftui/.../LibWhisper.swift` in whisper.cpp).
