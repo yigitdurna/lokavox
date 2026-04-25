@@ -64,7 +64,7 @@ struct SettingsView: View {
         } header: {
             Text("Language")
         } footer: {
-            Text("Pick the language you dictate in. \"Auto-detect\" uses your iPhone's system language as a default — fine if that matches what you speak, but pick explicitly here if not (e.g. Türkçe). Vocabulary biasing only works against the selected language.")
+            Text("Pick the language you dictate in. \"Auto-detect\" runs real audio-based detection on each utterance — same approach the Mac version uses. Pick explicitly if you want to skip the detection pass (~100 ms faster) or if detection is unreliable in noisy conditions. Vocabulary biasing only works against the selected language.")
                 .font(.footnote)
         }
     }

@@ -351,7 +351,7 @@ struct ContentView: View {
                     diagRow("Samples", "\(diag.sampleCount)")
                     diagRow("Peak amp", String(format: "%.4f", diag.samplePeakAbs))
                     diagRow("Mean amp", String(format: "%.4f", diag.sampleMeanAbs))
-                    diagRow("Language", diag.languageUsed)
+                    diagRow("Language", diag.languageUsed + (diag.autoDetected ? " (auto)" : ""))
                     diagRow("Vocab sent", diag.initialPromptUsed.isEmpty ? "(none)" : "\"\(diag.initialPromptUsed)\"")
                     diagRow("Segments", "\(diag.segmentCount)")
                     diagRow("whisper_full code", "\(diag.returnCode)")

@@ -64,9 +64,13 @@ actor WhisperEngine {
         let samplePeakAbs: Float
         let sampleMeanAbs: Float
         /// The language string actually passed to whisper.cpp (e.g. "en",
-        /// "tr"). When user has Settings → Language = Auto we default to
-        /// "en" inside the engine.
+        /// "tr").
         let languageUsed: String
+        /// True iff `languageUsed` came from `whisper_lang_auto_detect()`
+        /// rather than an explicit Settings choice or the locale fallback.
+        /// Lets the diagnostics panel render "tr (auto)" so we can see at
+        /// a glance whether real audio-based detection actually ran.
+        let autoDetected: Bool
         /// The vocabulary / initial_prompt string actually passed to
         /// whisper.cpp. If user reports "vocab isn't biasing output" we
         /// can distinguish "never reached the engine" from "reached the
@@ -143,7 +147,7 @@ actor WhisperEngine {
             languageCode: languageCode
         )
 
-        if case let .success(text, raw, segments, code) = firstAttempt {
+        if case let .success(text, raw, segments, code, langUsed, autoDetected) = firstAttempt {
             lastDiagnostics = Diagnostics(
                 rawOutput: raw,
                 trimmedOutput: text,
@@ -154,7 +158,8 @@ actor WhisperEngine {
                 sampleCount: audioSamples.count,
                 samplePeakAbs: peak,
                 sampleMeanAbs: mean,
-                languageUsed: resolveLanguage(languageCode),
+                languageUsed: langUsed,
+                autoDetected: autoDetected,
                 initialPromptUsed: initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             )
             return text
@@ -176,7 +181,7 @@ actor WhisperEngine {
                 languageCode: languageCode
             )
             switch secondAttempt {
-            case let .success(text, raw, segments, code):
+            case let .success(text, raw, segments, code, langUsed, autoDetected):
                 lastDiagnostics = Diagnostics(
                     rawOutput: raw,
                     trimmedOutput: text,
@@ -187,7 +192,8 @@ actor WhisperEngine {
                     sampleCount: audioSamples.count,
                     samplePeakAbs: peak,
                     sampleMeanAbs: mean,
-                    languageUsed: resolveLanguage(languageCode),
+                    languageUsed: langUsed,
+                    autoDetected: autoDetected,
                     initialPromptUsed: initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
                 return text
@@ -202,7 +208,8 @@ actor WhisperEngine {
                     sampleCount: audioSamples.count,
                     samplePeakAbs: peak,
                     sampleMeanAbs: mean,
-                    languageUsed: resolveLanguage(languageCode),
+                    languageUsed: languageCode ?? fallbackLanguage(),
+                    autoDetected: false,
                     initialPromptUsed: initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
                 throw EngineError.transcribeFailed(code: code)
@@ -220,7 +227,8 @@ actor WhisperEngine {
                 sampleCount: audioSamples.count,
                 samplePeakAbs: peak,
                 sampleMeanAbs: mean,
-                languageUsed: resolveLanguage(languageCode),
+                languageUsed: languageCode ?? fallbackLanguage(),
+                autoDetected: false,
                 initialPromptUsed: initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             )
             throw EngineError.transcribeFailed(code: code)
@@ -231,7 +239,7 @@ actor WhisperEngine {
     // MARK: - Internal
 
     private enum TranscribeResult {
-        case success(trimmed: String, raw: String, segments: Int32, code: Int32)
+        case success(trimmed: String, raw: String, segments: Int32, code: Int32, languageUsed: String, autoDetected: Bool)
         case failure(Int32)
     }
 
@@ -245,25 +253,49 @@ actor WhisperEngine {
         return whisper_init_from_file_with_params(url.path, params)
     }
 
-    /// Resolve the user-facing language code (nil = Settings "Auto") to a
-    /// concrete whisper-accepted string.
-    ///
-    /// We deliberately do NOT call whisper's runtime auto-detect path. On
-    /// the large-v3-turbo + whisper.cpp v1.8.4 build we ship, passing
-    /// `language = "auto"` + `detect_language = true` silently produces
-    /// zero segments on iPhone (reproduced twice). Instead we fall back to
-    /// the iOS device's system language — `Locale.current.language.
-    /// languageCode` — which gives us "tr" for a Turkish-localised phone
-    /// and "en" for an English one. Better than always defaulting to "en"
-    /// regardless of who's speaking. If iOS reports a code whisper doesn't
-    /// know we still degrade to "en" rather than failing.
-    private func resolveLanguage(_ code: String?) -> String {
-        if let code, !code.isEmpty { return code }
+    /// Last-resort fallback language when the caller passed Auto and
+    /// `whisper_lang_auto_detect()` either failed or wasn't applicable.
+    /// Returns the iOS device's system language code, or "en" if even
+    /// that lookup fails.
+    private func fallbackLanguage() -> String {
         if let systemCode = Locale.current.language.languageCode?.identifier,
            !systemCode.isEmpty {
             return systemCode
         }
         return "en"
+    }
+
+    /// Run a real audio-based language-detection pass — the same approach
+    /// `whisper-cli` uses for `-l auto`. Two C calls in sequence:
+    /// `whisper_pcm_to_mel` to populate the encoder input, then
+    /// `whisper_lang_auto_detect` which runs the encoder and projects to
+    /// language probabilities. Returns the 2-letter code of the top match
+    /// (e.g. "tr", "en"), or nil on hard failure.
+    ///
+    /// This is a different code path from `whisper_full`'s internal
+    /// `detect_language = true` flag, which silently returns zero segments
+    /// on this build/model (see CLAUDE.md step-6 gotcha #1). Cost: roughly
+    /// one extra encoder pass per transcribe — ~100 ms on Metal.
+    private func detectLanguage(ctx: OpaquePointer, samples: [Float], nThreads: Int32) -> String? {
+        guard !samples.isEmpty else { return nil }
+
+        let melResult = samples.withUnsafeBufferPointer { buf -> Int32 in
+            guard let base = buf.baseAddress else { return -1 }
+            return whisper_pcm_to_mel(ctx, base, Int32(buf.count), nThreads)
+        }
+        guard melResult == 0 else { return nil }
+
+        let maxId = whisper_lang_max_id()
+        var probs = [Float](repeating: 0, count: Int(maxId) + 1)
+
+        let langId = probs.withUnsafeMutableBufferPointer { bufPtr -> Int32 in
+            guard let base = bufPtr.baseAddress else { return -1 }
+            return whisper_lang_auto_detect(ctx, 0, nThreads, base)
+        }
+        guard langId >= 0 else { return nil }
+
+        guard let cstr = whisper_lang_str(langId) else { return nil }
+        return String(cString: cstr)
     }
 
     /// Peak + mean absolute amplitude of the sample buffer. Cheap to compute
@@ -298,46 +330,35 @@ actor WhisperEngine {
     ) -> TranscribeResult {
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
-        // Compute threads: 4 is a safe ceiling on iPhone A18 — more cores
-        // exist (performance + efficiency) but whisper.cpp tends to regress
-        // past 4 on smaller SoCs. Leave 2 cores free for the audio thread +
-        // system.
-        // Minimal param set. Previously we had many overrides trying to
-        // force output; on-device all of them produced 0 segments on clean
-        // audio. Back to near-defaults + the Mac `whisper-cli` flag set:
-        // `-nt` (no timestamps), language, initial prompt, threads. Let
-        // the library decide the rest.
-        params.n_threads = Int32(max(1, min(4, ProcessInfo.processInfo.processorCount - 2)))
+        // 4 thread ceiling on A18 — whisper.cpp regresses past 4 on
+        // smaller SoCs. Leave 2 cores free for audio + system.
+        let nThreads = Int32(max(1, min(4, ProcessInfo.processInfo.processorCount - 2)))
+        params.n_threads = nThreads
         params.print_realtime = false
         params.print_progress = false
         params.print_special = false
         params.no_timestamps = true    // matches Mac whisper-cli `-nt`
         params.translate = false
-
-        // Language handling: always pass a concrete whisper language code
-        // (never `"auto"` — see `resolveLanguage` note). `detect_language`
-        // stays off so whisper honours the string verbatim.
-        let resolvedLang = resolveLanguage(languageCode)
         params.detect_language = false
-
-        // Speed: default is 5 candidate sequences per token. For dictation
-        // (short clips, speaker clarity, no beam search needed) 1 is enough
-        // and ~30% faster per transcribe with negligible quality difference.
         params.greedy.best_of = 1
 
-        // Pass `language` and `initial_prompt` via nested `withCString`
-        // closures — the canonical upstream pattern (see
-        // `examples/whisper.swiftui/.../LibWhisper.swift` in whisper.cpp).
-        // Pointer lifetime is scoped to the closure, which fully contains
-        // the `whisper_full` call.
-        //
-        // Critical: we no longer pass `language = nil + detect_language =
-        // true`. On the large-v3-turbo model on iPhone 16 Pro that path
-        // silently returned zero segments. Falling back to "en" whenever
-        // Settings → Language is set to Auto. If the user dictates mostly
-        // in a non-English language they should pick it explicitly in
-        // Settings. Mac's whisper-cli always passes `-l <lang>` for the
-        // same reason.
+        // Resolve the concrete whisper language code to pass into
+        // `whisper_full`. Auto-detect (caller passes nil/empty) goes
+        // through our own `pcm_to_mel + whisper_lang_auto_detect` pre-pass
+        // because `whisper_full`'s internal detect_language = true path
+        // produces zero segments on this build (see `detectLanguage`).
+        let resolvedLang: String
+        let autoDetected: Bool
+        if let code = languageCode, !code.isEmpty {
+            resolvedLang = code
+            autoDetected = false
+        } else if let detected = detectLanguage(ctx: ctx, samples: audioSamples, nThreads: nThreads) {
+            resolvedLang = detected
+            autoDetected = true
+        } else {
+            resolvedLang = fallbackLanguage()
+            autoDetected = false
+        }
         let lang = resolvedLang
         let prompt = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -374,7 +395,7 @@ actor WhisperEngine {
             }
         }
         let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return .success(trimmed: trimmed, raw: out, segments: segmentCount, code: code)
+        return .success(trimmed: trimmed, raw: out, segments: segmentCount, code: code, languageUsed: lang, autoDetected: autoDetected)
     }
 
     deinit {
