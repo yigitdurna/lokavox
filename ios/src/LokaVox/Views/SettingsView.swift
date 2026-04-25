@@ -64,7 +64,7 @@ struct SettingsView: View {
         } header: {
             Text("Language")
         } footer: {
-            Text("Pick the language you dictate in. \"Auto-detect\" falls back to English on this device and will not transcribe other languages correctly — set this to Türkçe if you speak Turkish. Vocabulary biasing only works against the selected language.")
+            Text("Pick the language you dictate in. \"Auto-detect\" uses your iPhone's system language as a default — fine if that matches what you speak, but pick explicitly here if not (e.g. Türkçe). Vocabulary biasing only works against the selected language.")
                 .font(.footnote)
         }
     }

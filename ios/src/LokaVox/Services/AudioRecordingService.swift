@@ -113,13 +113,19 @@ final class AudioRecordingService: @unchecked Sendable {
 
         let session = AVAudioSession.sharedInstance()
         do {
-            // `.default` mode rather than `.measurement`. `.measurement`
-            // disables iOS's signal-processing stack (AGC, noise-suppress,
-            // echo-cancel) — good on paper for whisper, but brittle in
-            // practice: it rejects some device + BT routing configurations
-            // and the engine throws CoreAudio error 2003329396 on start.
-            // `.default` is permissive and whisper handles mild iOS AGC fine.
-            try session.setCategory(.record, mode: .default, options: [])
+            // `.measurement` disables iOS's input signal-processing stack
+            // (AGC, noise suppression, echo cancellation). whisper handles
+            // its own normalisation and these processors actively hurt
+            // non-English transcription — Turkish phonemes get mangled by
+            // AGC into something the model can't recognise. Mac uses the
+            // CoreAudio equivalent of this mode.
+            //
+            // We tried `.default` briefly to work around CoreAudio error
+            // 2003329396 on engine start, but the real fix for that error
+            // turned out to be `engine.reset()` + retry (below), which now
+            // lets `.measurement` work reliably. Quality > a fallback that
+            // wasn't actually needed.
+            try session.setCategory(.record, mode: .measurement, options: [])
             try session.setActive(true, options: [])
         } catch {
             throw RecordingError.sessionConfigurationFailed(error.localizedDescription)

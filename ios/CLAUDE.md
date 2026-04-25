@@ -187,7 +187,7 @@ WhisperKit was swapped out for whisper.cpp. Reason: on iPhone 16 Pro / A18, Whis
 ### Known gotchas from step 6 tuning (all baked into current code)
 1. `language = nil + detect_language = true` silently returns zero segments on this build/model. Engine always passes a concrete language code; defaults to `"en"` when Settings → Language = Auto. Surfaced in Settings footer: non-English users must pick a language explicitly.
 2. `suppress_nst = true` and `flash_attn = true` both cause silent-zero-segments on this build. Disabled in `WhisperEngine.swift`.
-3. `.measurement` audio-session mode rejected some routing configurations with CoreAudio error 2003329396. Switched to `.default`. `engine.reset()` + single retry wraps transient CoreAudio failures in the start path.
+3. `.measurement` audio-session mode disables iOS's input signal-processing stack (AGC, noise suppression, echo cancellation) — the right mode for whisper. iOS AGC mangled Turkish phonemes badly enough that whisper translated to English or returned isolated random words. We briefly switched to `.default` to dodge a CoreAudio error 2003329396 on engine start, but the real fix for that error is the `engine.reset()` + single retry path now in `AudioRecordingService.startEngine()`, which lets `.measurement` work reliably.
 4. `greedy.best_of = 1` (default 5) for ~30% speed win on dictation clips.
 5. Whisper `initial_prompt` (vocab) biasing is soft — matches Mac behavior, no hard guarantees. Corrections run post-transcribe via word-boundary case-insensitive regex, mirroring Mac's `fixups_compiled()`. Hallucination denylist ported from Mac's `_HALLUCINATIONS` set.
 

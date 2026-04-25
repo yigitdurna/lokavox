@@ -248,14 +248,21 @@ actor WhisperEngine {
     /// Resolve the user-facing language code (nil = Settings "Auto") to a
     /// concrete whisper-accepted string.
     ///
-    /// We deliberately do NOT honour whisper's auto-detect path here. On
+    /// We deliberately do NOT call whisper's runtime auto-detect path. On
     /// the large-v3-turbo + whisper.cpp v1.8.4 build we ship, passing
-    /// language=`"auto"` + `detect_language=true` silently produces zero
-    /// segments on iPhone (reproduced twice). Falling back to `"en"` means
-    /// non-English speakers *must* pick a language in Settings to get good
-    /// output — documented in Settings → Language footer.
+    /// `language = "auto"` + `detect_language = true` silently produces
+    /// zero segments on iPhone (reproduced twice). Instead we fall back to
+    /// the iOS device's system language — `Locale.current.language.
+    /// languageCode` — which gives us "tr" for a Turkish-localised phone
+    /// and "en" for an English one. Better than always defaulting to "en"
+    /// regardless of who's speaking. If iOS reports a code whisper doesn't
+    /// know we still degrade to "en" rather than failing.
     private func resolveLanguage(_ code: String?) -> String {
         if let code, !code.isEmpty { return code }
+        if let systemCode = Locale.current.language.languageCode?.identifier,
+           !systemCode.isEmpty {
+            return systemCode
+        }
         return "en"
     }
 
