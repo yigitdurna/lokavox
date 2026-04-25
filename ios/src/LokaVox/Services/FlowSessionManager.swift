@@ -44,6 +44,11 @@ final class FlowSessionManager {
     /// actually produced — useful when the keyboard claims "inserted" but
     /// the host app looks blank.
     private(set) var lastEngineDiagnostics: WhisperEngine.Diagnostics?
+    /// True iff the last transcribe reused `cachedDetectedLanguage` from the
+    /// current Flow session instead of running a fresh `whisper_lang_auto_
+    /// detect` pre-pass. Drives the diagnostics row "(cached)" suffix so the
+    /// user can see at a glance whether the detection cost was paid.
+    private(set) var lastTranscribeUsedCachedLanguage: Bool = false
 
     // MARK: - Tunables
 
@@ -83,6 +88,16 @@ final class FlowSessionManager {
     /// Latest generation counter read from SessionStore when a segment began.
     /// Used to tag the transcript write so the keyboard dedupes correctly.
     private var activeGeneration: Int?
+
+    /// Language detected on the first auto-detect transcribe of the current
+    /// Flow session. Reused for follow-up transcribes so each in-keyboard
+    /// utterance doesn't pay the ~5–7 s `pcm_to_mel + whisper_lang_auto_
+    /// detect` pre-pass on iOS 26 — backgrounded keyboard transcription is
+    /// CPU-bound there because Metal is revoked (whisper.cpp#3531). Reset
+    /// in `exitFlow` so a new Flow window re-detects from scratch.
+    /// Tradeoff: if you switch languages mid-session, transcription stays
+    /// pinned to the first detected language until you End Flow.
+    private var cachedDetectedLanguage: String?
 
     /// Fires when Flow exits for any reason — the view model uses this to
     /// clear URL-banner state. Set on the main actor.
@@ -220,13 +235,30 @@ final class FlowSessionManager {
                 throw WhisperEngine.EngineError.notLoaded
             }
 
+            // Auto-detect cache: when Settings → Language is .auto and we've
+            // already detected on a prior segment in this Flow window, reuse
+            // that code so the engine skips the detect pre-pass. Explicit
+            // Settings choices always win.
+            let explicitCode = settings.language.whisperCode
+            let usingCache = explicitCode == nil && cachedDetectedLanguage != nil
+            let effectiveCode = explicitCode ?? cachedDetectedLanguage
+            lastTranscribeUsedCachedLanguage = usingCache
+
             let raw = try await engine.transcribe(
                 audioSamples: samples,
                 initialPrompt: settings.initialPrompt,
-                languageCode: settings.language.whisperCode
+                languageCode: effectiveCode
             )
             lastEngineDiagnostics = await engine.snapshotDiagnostics()
             lastLatencyMs = Int(Date().timeIntervalSince(start) * 1000)
+            // Capture the detection result for follow-up segments. Only
+            // cache if the engine actually ran detection (autoDetected),
+            // not on the locale-fallback path.
+            if explicitCode == nil,
+               let diag = lastEngineDiagnostics,
+               diag.autoDetected {
+                cachedDetectedLanguage = diag.languageUsed
+            }
             let text = settings.postProcess(raw)
             lastTranscript = text
             sessionStore.markDone(transcript: text)
@@ -283,6 +315,8 @@ final class FlowSessionManager {
         }
 
         flowExpiresAt = nil
+        cachedDetectedLanguage = nil
+        lastTranscribeUsedCachedLanguage = false
         sessionStore.clearFlow()
 
         // If the last publishable state was mid-segment, surface the exit as

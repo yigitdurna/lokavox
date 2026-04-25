@@ -351,7 +351,7 @@ struct ContentView: View {
                     diagRow("Samples", "\(diag.sampleCount)")
                     diagRow("Peak amp", String(format: "%.4f", diag.samplePeakAbs))
                     diagRow("Mean amp", String(format: "%.4f", diag.sampleMeanAbs))
-                    diagRow("Language", diag.languageUsed + (diag.autoDetected ? " (auto)" : ""))
+                    diagRow("Language", diag.languageUsed + languageDetectionSuffix(diag: diag))
                     diagRow("Vocab sent", diag.initialPromptUsed.isEmpty ? "(none)" : "\"\(diag.initialPromptUsed)\"")
                     diagRow("Segments", "\(diag.segmentCount)")
                     diagRow("whisper_full code", "\(diag.returnCode)")
@@ -366,6 +366,16 @@ struct ContentView: View {
             .background(Color.yellow.opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
+    }
+
+    /// Render the language origin as a parenthesised suffix:
+    /// - `(auto)` when whisper.cpp's `whisper_lang_auto_detect` ran on this transcribe.
+    /// - `(cached)` when we reused a Flow-session-cached detection from a prior segment.
+    /// - empty when the user picked an explicit language in Settings.
+    private func languageDetectionSuffix(diag: WhisperEngine.Diagnostics) -> String {
+        if diag.autoDetected { return " (auto)" }
+        if vm.flow.lastTranscribeUsedCachedLanguage { return " (cached)" }
+        return ""
     }
 
     private func diagRow(_ label: String, _ value: String, extra: String = "") -> some View {
