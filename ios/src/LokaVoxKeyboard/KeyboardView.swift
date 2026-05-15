@@ -38,6 +38,8 @@ struct KeyboardView: View {
 
     private let recordURL = URL(string: "lokavox://record")!
 
+    @State private var pulse = false
+
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 10) {
@@ -63,9 +65,9 @@ struct KeyboardView: View {
 
     private var bottomRow: some View {
         HStack(spacing: 6) {
-            utilityKey(systemImage: "arrow.uturn.left", action: onReturnTap, accessibilityLabel: "Return")
-            spaceKey
             utilityKey(systemImage: "delete.backward.fill", action: onDeleteTap, accessibilityLabel: "Delete")
+            spaceKey
+            utilityKey(systemImage: "return", action: onReturnTap, accessibilityLabel: "Return")
         }
         .frame(height: 44)
     }
@@ -116,22 +118,65 @@ struct KeyboardView: View {
             .disabled(!micEnabled)
         case .warmRecording:
             Button(action: onMicWarmStop) {
-                micLabel(color: .red, icon: "stop.fill")
+                micLabel(color: .red, icon: "stop.fill", recording: true)
             }
             .disabled(!micEnabled)
         case .warmTranscribing:
-            micLabel(color: Color.gray.opacity(0.5), icon: "ellipsis")
-                .opacity(0.8)
+            micLabel(color: Color.gray, icon: "ellipsis", transcribing: true)
+                .opacity(0.85)
         }
     }
 
-    private func micLabel(color: Color, icon: String) -> some View {
+    private func micLabel(
+        color: Color,
+        icon: String,
+        recording: Bool = false,
+        transcribing: Bool = false
+    ) -> some View {
         Image(systemName: icon)
-            .font(.system(size: 36, weight: .semibold))
+            .font(.system(size: 38, weight: .semibold))
             .foregroundStyle(.white)
-            .padding(24)
-            .background(color)
-            .clipShape(Capsule())
+            .symbolEffect(.pulse, options: .repeating, isActive: transcribing)
+            .frame(width: 104, height: 104)
+            .background(
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            gradient: Gradient(stops: [
+                                .init(color: color.opacity(0.88), location: 0),
+                                .init(color: color, location: 0.55),
+                                .init(color: color.opacity(0.92), location: 1)
+                            ]),
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            )
+            .shadow(color: color.opacity(0.45), radius: 14, x: 0, y: 8)
+            .shadow(color: .black.opacity(0.18), radius: 6, x: 0, y: 2)
+            .scaleEffect(recording && pulse ? 1.06 : 1.0)
+            .onAppear {
+                if recording {
+                    withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                        pulse = true
+                    }
+                }
+            }
+            .onChange(of: recording) { _, isOn in
+                if isOn {
+                    withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                        pulse = true
+                    }
+                } else {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        pulse = false
+                    }
+                }
+            }
     }
 
     private func flowPill(seconds: Int) -> some View {
