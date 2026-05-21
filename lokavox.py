@@ -859,15 +859,42 @@ class LokaVox:
             self.menubar.transcribing()
         return self.audio_file
 
+    def _detect_language(self, audio_path):
+        # Run whisper-cli with -dl to detect language without prompt bias.
+        # The vocab prompt skews auto-detection (Turkish words tip English audio
+        # toward Turkish on short/ambiguous clips), so detect first without it.
+        cmd = [
+            "whisper-cli",
+            "-m", str(MODEL),
+            "-l", "auto",
+            "-dl",
+            "-f", audio_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            for line in result.stderr.splitlines():
+                if "auto-detected language:" in line:
+                    parts = line.split("auto-detected language:")[1].strip().split()
+                    if parts:
+                        return parts[0]
+        except Exception:
+            pass
+        return None
+
     def transcribe(self, audio_path):
         if not audio_path or not os.path.exists(audio_path):
             return ""
         if os.path.getsize(audio_path) < 1000:
             return ""
+        lang = self.language
+        if lang == "auto":
+            detected = self._detect_language(audio_path)
+            if detected:
+                lang = detected
         cmd = [
             "whisper-cli",
             "-m", str(MODEL),
-            "-l", self.language,
+            "-l", lang,
             "-nt",
             "--prompt", settings.vocab_string(),
             "-f", audio_path,
