@@ -39,7 +39,7 @@ from pathlib import Path
 try:
     import objc
     import Quartz
-    from Foundation import NSObject, NSCharacterSet
+    from Foundation import NSObject, NSCharacterSet, NSTimer
     from AppKit import (
         NSApplication,
         NSImage,
@@ -90,6 +90,12 @@ KEYCODE_DICTATION = 176   # Dedicated mic/dictation key on modern Macs
 HOLD_DELAY = 0.25         # Hold modifier this long before recording starts
 DOUBLE_TAP_WINDOW = 0.35  # F5 mode double-tap toggle window
 MIN_RECORDING_SECS = 0.7  # Ignore accidentally short recordings
+
+# Audio energy gate. A capture whose RMS amplitude is below this is treated as
+# silence (e.g. sox recorded zeros because Microphone permission never reached
+# the child process). Speech is typically > 0.01; true silence is ~0. Gating
+# here stops whisper from echoing the --prompt vocab on silence.
+SILENCE_RMS_THRESHOLD = 0.003
 
 # Hotkey modes
 HOTKEY_CONTROL = "Control"
@@ -698,6 +704,12 @@ class MenuBar:
 
         self.status_item.setImage_(self._icons.get("mic_idle"))
 
+        # Animation state for the transcribing phase (a breathing pulse so it
+        # reads as "working", distinct from the solid recording icon).
+        self._anim_timer = None
+        self._anim_index = 0
+        self._anim_frames = self._build_pulse_frames("mic_transcribing")
+
         self._prefs = _PrefsController.alloc().init()
 
         menu = NSMenu.alloc().init()
@@ -713,19 +725,67 @@ class MenuBar:
         menu.addItem_(quit_item)
         self.status_item.setMenu_(menu)
 
-    def _set(self, name):
-        img = self._icons.get(name)
-        if img:
-            AppHelper.callAfter(self.status_item.setImage_, img)
+    def _build_pulse_frames(self, name):
+        """Pre-render a 'breathing' pulse of the given icon by drawing it at
+        varying opacity, so the transcribing state animates instead of sitting
+        static. Frames stay template images so macOS keeps theming them."""
+        base = self._icons.get(name)
+        if not base:
+            return []
+        size = base.size()
+        rect = ((0.0, 0.0), (size.width, size.height))
+        fractions = [1.0, 0.8, 0.55, 0.35, 0.25, 0.35, 0.55, 0.8]
+        frames = []
+        for frac in fractions:
+            frame = NSImage.alloc().initWithSize_(size)
+            frame.lockFocus()
+            # 2 = NSCompositingOperationSourceOver
+            base.drawInRect_fromRect_operation_fraction_(rect, rect, 2, frac)
+            frame.unlockFocus()
+            frame.setTemplate_(True)
+            frames.append(frame)
+        return frames
+
+    # --- State transitions (always marshalled to the main thread) ---
 
     def recording(self):
-        self._set("mic_recording")
+        AppHelper.callAfter(self._show_static, "mic_recording")
 
     def transcribing(self):
-        self._set("mic_transcribing")
+        AppHelper.callAfter(self._start_anim)
 
     def idle(self):
-        self._set("mic_idle")
+        AppHelper.callAfter(self._show_static, "mic_idle")
+
+    # --- Main-thread implementations ---
+
+    def _show_static(self, name):
+        self._stop_anim()
+        img = self._icons.get(name)
+        if img:
+            self.status_item.setImage_(img)
+
+    def _start_anim(self):
+        self._stop_anim()
+        if not self._anim_frames:
+            self._show_static("mic_transcribing")
+            return
+        self.status_item.setImage_(self._anim_frames[0])
+        self._anim_index = 1
+
+        def tick(timer):
+            frames = self._anim_frames
+            self.status_item.setImage_(frames[self._anim_index % len(frames)])
+            self._anim_index += 1
+
+        self._anim_timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            0.11, True, tick
+        )
+
+    def _stop_anim(self):
+        if self._anim_timer is not None:
+            self._anim_timer.invalidate()
+            self._anim_timer = None
 
 
 class LokaVox:
@@ -881,10 +941,43 @@ class LokaVox:
             pass
         return None
 
+    def _is_silent(self, audio_path):
+        """True if the capture is essentially silent — e.g. sox recorded zeros
+        because Microphone permission never reached the child process. Gating
+        here stops whisper echoing the --prompt vocab on silence."""
+        try:
+            result = subprocess.run(
+                ["sox", audio_path, "-n", "stat"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stderr.splitlines():
+                if "RMS" in line and "amplitude" in line:
+                    return float(line.split(":")[1]) < SILENCE_RMS_THRESHOLD
+        except Exception:
+            pass
+        return False
+
+    def _is_vocab_echo(self, text):
+        """True if the transcript is nothing but vocab/prompt tokens — whisper
+        echoing the --prompt back on near-silent audio (the 'Claude Claude'
+        failure that the _HALLUCINATIONS denylist does not cover)."""
+        vocab_words = {
+            w.strip(".,!?").lower()
+            for phrase in settings.vocab
+            for w in phrase.split()
+            if w.strip(".,!?")
+        }
+        if not vocab_words:
+            return False
+        words = [w.strip(".,!?").lower() for w in text.split() if w.strip(".,!?")]
+        return bool(words) and all(w in vocab_words for w in words)
+
     def transcribe(self, audio_path):
         if not audio_path or not os.path.exists(audio_path):
             return ""
         if os.path.getsize(audio_path) < 1000:
+            return ""
+        if self._is_silent(audio_path):
             return ""
         lang = self.language
         if lang == "auto":
@@ -903,6 +996,8 @@ class LokaVox:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             text = " ".join(result.stdout.strip().split())
             if text.lower().rstrip(".!,") in _HALLUCINATIONS:
+                return ""
+            if self._is_vocab_echo(text):
                 return ""
             for pattern, replacement in settings.fixups_compiled():
                 text = pattern.sub(replacement, text)
@@ -1099,6 +1194,52 @@ class LokaVox:
 
     # --- Run loop ---
 
+    def _request_microphone(self):
+        """Proactively request mic access so macOS shows the permission prompt
+        attributed to LokaVox.app and registers it under System Settings >
+        Privacy & Security > Microphone. Without this, the spawned sox
+        subprocess's mic request is silently denied on modern macOS (no prompt,
+        silent capture). Requires NSMicrophoneUsageDescription in Info.plist."""
+        try:
+            import AVFoundation
+            audio = AVFoundation.AVMediaTypeAudio
+            status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(audio)
+            # 0=notDetermined 1=restricted 2=denied 3=authorized
+            if status == 0:
+                AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                    audio, lambda granted: None
+                )
+        except Exception:
+            pass
+
+    def _prompt_for_accessibility(self):
+        """The event tap failed → Accessibility permission is missing. A
+        Finder-launched app has no console, so instead of exiting invisibly we
+        show an alert with a shortcut straight to the Settings pane."""
+        print("Failed to create event tap — Accessibility permission missing.")
+        try:
+            from AppKit import NSAlert, NSWorkspace
+            from Foundation import NSURL
+            NSApp.activateIgnoringOtherApps_(True)
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("LokaVox needs Accessibility permission")
+            alert.setInformativeText_(
+                "LokaVox uses Accessibility to capture your dictation hotkey "
+                "and paste transcribed text.\n\n"
+                "Enable LokaVox under System Settings → Privacy & Security "
+                "→ Accessibility, then launch LokaVox again."
+            )
+            alert.addButtonWithTitle_("Open Accessibility Settings")
+            alert.addButtonWithTitle_("Quit")
+            if alert.runModal() == 1000:  # NSAlertFirstButtonReturn
+                url = NSURL.URLWithString_(
+                    "x-apple.systempreferences:com.apple.preference."
+                    "security?Privacy_Accessibility"
+                )
+                NSWorkspace.sharedWorkspace().openURL_(url)
+        except Exception:
+            pass
+
     def run(self):
         self.preflight()
 
@@ -1119,6 +1260,7 @@ class LokaVox:
         self._app_delegate = _AppDelegate.alloc().init()
         app.setDelegate_(self._app_delegate)
         self.menubar = MenuBar()
+        self._request_microphone()
 
         # CGEventTap — intercepts keyboard events. FlagsChanged is required
         # for Control-mode modifier detection; KeyDown/KeyUp for F5 and for
@@ -1139,9 +1281,7 @@ class LokaVox:
         )
 
         if self._tap is None:
-            print("Failed to create event tap.")
-            print("Grant Accessibility permission in:")
-            print("  System Settings → Privacy & Security → Accessibility")
+            self._prompt_for_accessibility()
             sys.exit(1)
 
         source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
